@@ -40,6 +40,7 @@ pub use report::{
     VerificationReport,
 };
 
+use crate::core::revision::{DefaultSafeObjectClassifier, RevisionAnalysis};
 use crate::crypto::algorithm::DigestAlgorithm;
 use crate::error::{PdfSignError, VerifyError};
 use crate::trust::TrustStoreSet;
@@ -89,12 +90,17 @@ impl<'a> SignatureVerifier<'a> {
             return Err(VerifyError::NoSignatures.into());
         }
 
+        // Step 1b: Run revision analysis (best-effort; if it fails, fall back)
+        let revision_analysis =
+            RevisionAnalysis::analyze(pdf_data, &DefaultSafeObjectClassifier).ok();
+
         let mut results = Vec::with_capacity(extracted.len());
         let num_sigs = extracted.len();
 
         for (idx, sig) in extracted.iter().enumerate() {
             let is_last = idx == num_sigs - 1;
-            let result = self.verify_single_signature(pdf_data, sig, is_last);
+            let result =
+                self.verify_single_signature(pdf_data, sig, is_last, revision_analysis.as_ref());
             results.push(result);
         }
 
@@ -137,6 +143,7 @@ impl<'a> SignatureVerifier<'a> {
         pdf_data: &[u8],
         sig: &ExtractedSignature,
         is_last: bool,
+        revision_analysis: Option<&RevisionAnalysis>,
     ) -> SignatureVerificationResult {
         let mut all_issues = Vec::new();
 
@@ -241,13 +248,24 @@ impl<'a> SignatureVerifier<'a> {
             .as_ref()
             .map(|cert| format!("{}", cert.tbs_certificate.subject));
 
-        // --- Step E: Check post-signature modifications ---
-        let modifications_after_signing = if is_last {
-            integrity::check_post_signature_modifications(pdf_data, &sig.byte_range)
-        } else {
-            // Non-last signatures naturally don't cover the full file
-            true
-        };
+        // --- Step E: Check post-signature modifications (revision analysis) ---
+        let (modifications_after_signing, covers_whole_doc_rev, extended_by_non_safe) =
+            if let Some(analysis) = revision_analysis {
+                let covers = analysis.covers_whole_document(&sig.byte_range);
+                let extended = analysis.is_extended_by_non_safe_updates(&sig.byte_range);
+                // modifications_after_signing = the signature doesn't cover everything
+                // AND there are non-safe extensions
+                let modified = !covers;
+                (modified, Some(covers), Some(extended))
+            } else {
+                // Fallback: simple byte offset check
+                let modified = if is_last {
+                    integrity::check_post_signature_modifications(pdf_data, &sig.byte_range)
+                } else {
+                    true
+                };
+                (modified, None, None)
+            };
 
         // --- Step F: Determine PAdES level ---
         let pades_level = match sig.signature_type {
@@ -283,6 +301,8 @@ impl<'a> SignatureVerifier<'a> {
             trust_anchor,
             pades_level,
             modifications_after_signing,
+            covers_whole_document_revision: covers_whole_doc_rev,
+            extended_by_non_safe_updates: extended_by_non_safe,
             summary,
         }
     }

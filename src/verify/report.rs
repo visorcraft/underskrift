@@ -89,6 +89,19 @@ pub struct SignatureVerificationResult {
     /// Whether the document was modified after this signature
     pub modifications_after_signing: bool,
 
+    /// Whether the signature covers the whole document (revision analysis).
+    ///
+    /// `true` if the signature is the last revision, or if all subsequent
+    /// revisions are safe (DSS updates, timestamps, etc.).
+    /// `None` if revision analysis was not performed.
+    pub covers_whole_document_revision: Option<bool>,
+
+    /// Whether the signature has been extended by non-safe updates.
+    ///
+    /// `true` if there are subsequent revisions that are neither signatures
+    /// nor valid DSS-only updates. `None` if revision analysis was not performed.
+    pub extended_by_non_safe_updates: Option<bool>,
+
     /// Human-readable summary
     pub summary: String,
 }

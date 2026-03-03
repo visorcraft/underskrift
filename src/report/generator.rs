@@ -353,6 +353,8 @@ mod tests {
             trust_anchor: Some("Root CA".to_string()),
             pades_level: DetectedPadesLevel::BB,
             modifications_after_signing: false,
+            covers_whole_document_revision: None,
+            extended_by_non_safe_updates: None,
             summary: "Signature is valid".to_string(),
         }
     }
@@ -375,6 +377,8 @@ mod tests {
             trust_anchor: None,
             pades_level: DetectedPadesLevel::NotPades,
             modifications_after_signing: false,
+            covers_whole_document_revision: None,
+            extended_by_non_safe_updates: None,
             summary: "Signature is invalid".to_string(),
         }
     }
@@ -504,6 +508,8 @@ mod tests {
             trust_anchor: None,
             pades_level: DetectedPadesLevel::Unknown,
             modifications_after_signing: false,
+            covers_whole_document_revision: None,
+            extended_by_non_safe_updates: None,
             summary: "Could not determine".to_string(),
         };
 

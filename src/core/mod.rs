@@ -12,3 +12,4 @@ pub mod incremental;
 pub mod doc_mdp;
 pub mod doc_timestamp;
 pub mod parser;
+pub mod revision;
