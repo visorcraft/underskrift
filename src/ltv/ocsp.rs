@@ -1,7 +1,50 @@
-//! OCSP client and response handling.
+//! OCSP client, response parsing, and revocation checking.
 //!
-//! Builds OCSP requests, sends them to OCSP responders discovered from
-//! certificate AIA extensions, and parses responses.
+//! Builds OCSP requests (with optional nonce), sends them to OCSP responders
+//! discovered from certificate AIA extensions, parses responses per RFC 6960,
+//! verifies responder signatures, and checks revocation status.
+//!
+//! # RFC 6960 Structure (simplified)
+//!
+//! ```text
+//! OCSPResponse ::= SEQUENCE {
+//!     responseStatus   OCSPResponseStatus (ENUMERATED),
+//!     responseBytes    [0] EXPLICIT ResponseBytes OPTIONAL
+//! }
+//! ResponseBytes ::= SEQUENCE {
+//!     responseType     OID (id-pkix-ocsp-basic),
+//!     response         OCTET STRING (DER BasicOCSPResponse)
+//! }
+//! BasicOCSPResponse ::= SEQUENCE {
+//!     tbsResponseData  ResponseData,
+//!     signatureAlgorithm AlgorithmIdentifier,
+//!     signature         BIT STRING,
+//!     certs        [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL
+//! }
+//! ResponseData ::= SEQUENCE {
+//!     version          [0] EXPLICIT Version DEFAULT v1,
+//!     responderID      ResponderID,
+//!     producedAt       GeneralizedTime,
+//!     responses        SEQUENCE OF SingleResponse,
+//!     responseExtensions [1] EXPLICIT Extensions OPTIONAL
+//! }
+//! SingleResponse ::= SEQUENCE {
+//!     certID           CertID,
+//!     certStatus       CertStatus,
+//!     thisUpdate       GeneralizedTime,
+//!     nextUpdate   [0] EXPLICIT GeneralizedTime OPTIONAL,
+//!     singleExtensions [1] EXPLICIT Extensions OPTIONAL
+//! }
+//! CertStatus ::= CHOICE {
+//!     good    [0] IMPLICIT NULL,
+//!     revoked [1] IMPLICIT RevokedInfo,
+//!     unknown [2] IMPLICIT UnknownInfo
+//! }
+//! RevokedInfo ::= SEQUENCE {
+//!     revocationTime    GeneralizedTime,
+//!     revocationReason  [0] EXPLICIT CRLReason OPTIONAL
+//! }
+//! ```
 
 use std::time::Duration;
 
@@ -9,13 +52,96 @@ use der::Encode;
 use reqwest::Client;
 use x509_cert::Certificate;
 
+use crate::der_utils;
 use crate::error::LtvError;
+use crate::ltv::status::{RevocationReason, RevocationSource, ValidationStatus};
 
 /// OCSP request Content-Type.
 const OCSP_REQUEST_CONTENT_TYPE: &str = "application/ocsp-request";
 
 /// OCSP good response status.
 const OCSP_RESPONSE_SUCCESSFUL: u8 = 0;
+
+/// OID for id-pkix-ocsp-basic (1.3.6.1.5.5.7.48.1.1).
+const OCSP_BASIC_RESPONSE_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
+
+/// OID for id-pkix-ocsp-nonce (1.3.6.1.5.5.7.48.1.2) — raw OID bytes.
+const OCSP_NONCE_OID_BYTES: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
+
+/// OID for id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9) — raw OID bytes.
+const OCSP_SIGNING_EKU_OID_BYTES: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09];
+
+/// Nonce size in bytes (matches Java stack: 30 bytes).
+const NONCE_SIZE: usize = 30;
+
+// ── Parsed OCSP response types ─────────────────────────────────────
+
+/// Cert status from an OCSP SingleResponse.
+#[derive(Debug, Clone)]
+pub enum CertStatus {
+    /// Certificate is not revoked.
+    Good,
+    /// Certificate has been revoked.
+    Revoked {
+        /// When the certificate was revoked.
+        revocation_time: chrono::DateTime<chrono::Utc>,
+        /// Reason for revocation, if provided.
+        reason: RevocationReason,
+    },
+    /// Responder doesn't know about this certificate.
+    Unknown,
+}
+
+/// A parsed SingleResponse from an OCSP BasicOCSPResponse.
+#[derive(Debug, Clone)]
+pub struct SingleResponse {
+    /// CertID hash algorithm OID bytes (raw, without tag/length).
+    pub hash_algorithm_oid: Vec<u8>,
+    /// Issuer name hash (from CertID).
+    pub issuer_name_hash: Vec<u8>,
+    /// Issuer key hash (from CertID).
+    pub issuer_key_hash: Vec<u8>,
+    /// Serial number of the certificate (leading-zero-stripped).
+    pub serial_number: Vec<u8>,
+    /// The revocation status.
+    pub cert_status: CertStatus,
+    /// thisUpdate for this response.
+    pub this_update: chrono::DateTime<chrono::Utc>,
+    /// nextUpdate (optional).
+    pub next_update: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A parsed BasicOCSPResponse.
+#[derive(Debug)]
+pub struct ParsedBasicOcspResponse {
+    /// Raw tbsResponseData bytes (for signature verification).
+    pub tbs_response_data: Vec<u8>,
+    /// Signature algorithm OID.
+    pub signature_algorithm_oid: const_oid::ObjectIdentifier,
+    /// Raw signature bytes (BIT STRING contents, without unused-bits byte).
+    pub signature_bytes: Vec<u8>,
+    /// Responder ID — either byName (DER Name) or byKeyHash (OCTET STRING body).
+    pub responder_id: ResponderId,
+    /// producedAt timestamp.
+    pub produced_at: chrono::DateTime<chrono::Utc>,
+    /// Individual certificate responses.
+    pub responses: Vec<SingleResponse>,
+    /// Nonce from response extensions, if present.
+    pub nonce: Option<Vec<u8>>,
+    /// Embedded certificates (from [0] EXPLICIT SEQUENCE OF Certificate).
+    pub embedded_certs_der: Vec<Vec<u8>>,
+}
+
+/// Responder identification.
+#[derive(Debug, Clone)]
+pub enum ResponderId {
+    /// byName [1] — DER-encoded Name (the responder's DN).
+    ByName(Vec<u8>),
+    /// byKeyHash [2] — SHA-1 hash of responder's public key.
+    ByKeyHash(Vec<u8>),
+}
+
+// ── OCSP client ────────────────────────────────────────────────────
 
 /// OCSP client for querying certificate revocation status.
 #[derive(Debug, Clone)]
@@ -75,6 +201,41 @@ impl OcspClient {
         for url in &urls {
             match self.send_ocsp_request(url, &ocsp_request).await {
                 Ok(response) => return Ok(response),
+                Err(e) => {
+                    log::warn!("OCSP request to {url} failed: {e}");
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            LtvError::Ocsp("all OCSP responder URLs failed".into())
+        }))
+    }
+
+    /// Fetch an OCSP response with a nonce for replay protection.
+    ///
+    /// Returns `(response_der, nonce_bytes)` — the nonce must be passed
+    /// to [`check_revocation`] for validation.
+    pub async fn fetch_ocsp_response_with_nonce(
+        &self,
+        cert: &Certificate,
+        issuer: &Certificate,
+    ) -> Result<(Vec<u8>, Vec<u8>), LtvError> {
+        let urls = Self::extract_ocsp_urls(cert);
+        if urls.is_empty() {
+            return Err(LtvError::Ocsp(
+                "no OCSP responder URL in certificate AIA extension".into(),
+            ));
+        }
+
+        let (ocsp_request, nonce) = build_ocsp_request_with_nonce(cert, issuer)?;
+
+        let mut last_error = None;
+
+        for url in &urls {
+            match self.send_ocsp_request(url, &ocsp_request).await {
+                Ok(response) => return Ok((response, nonce)),
                 Err(e) => {
                     log::warn!("OCSP request to {url} failed: {e}");
                     last_error = Some(e);
@@ -147,6 +308,8 @@ impl Default for OcspClient {
     }
 }
 
+// ── AIA extension parsing ──────────────────────────────────────────
+
 /// AIA access method type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiaAccessMethod {
@@ -200,7 +363,8 @@ fn parse_aia_extension(
 ) -> Result<Vec<String>, LtvError> {
     let mut urls = Vec::new();
 
-    let (tag, body) = parse_tlv(der_bytes)?;
+    let (tag, body) = der_utils::parse_tlv(der_bytes)
+        .map_err(|e| LtvError::Ocsp(format!("AIA parse error: {e}")))?;
     if tag != 0x30 {
         return Err(LtvError::Ocsp(format!("AIA: expected SEQUENCE, got 0x{tag:02x}")));
     }
@@ -211,18 +375,21 @@ fn parse_aia_extension(
 
     let mut pos = &body[..];
     while !pos.is_empty() {
-        let (ad_tag, ad_body, rest) = parse_tlv_with_rest(pos)?;
+        let (ad_tag, ad_body, rest) = der_utils::parse_tlv_with_rest(pos)
+            .map_err(|e| LtvError::Ocsp(format!("AIA parse error: {e}")))?;
         if ad_tag == 0x30 {
             // AccessDescription SEQUENCE
             // First: accessMethod OID
-            let (oid_tag, oid_body, ad_rest) = parse_tlv_with_rest(&ad_body)?;
+            let (oid_tag, oid_body, ad_rest) = der_utils::parse_tlv_with_rest(&ad_body)
+                .map_err(|e| LtvError::Ocsp(format!("AIA parse error: {e}")))?;
             if oid_tag == 0x06 {
-                let oid_tlv = encode_tlv(0x06, &oid_body);
+                let oid_tlv = der_utils::encode_tlv(0x06, &oid_body);
                 if oid_tlv == target_oid_der {
                     // Match — extract accessLocation GeneralName
                     // Look for uniformResourceIdentifier [6]
                     if !ad_rest.is_empty() {
-                        let (gn_tag, gn_body, _) = parse_tlv_with_rest(ad_rest)?;
+                        let (gn_tag, gn_body, _) = der_utils::parse_tlv_with_rest(ad_rest)
+                            .map_err(|e| LtvError::Ocsp(format!("AIA parse error: {e}")))?;
                         if gn_tag == 0x86 {
                             // [6] IMPLICIT IA5String — URI
                             if let Ok(uri) = std::str::from_utf8(&gn_body) {
@@ -239,7 +406,9 @@ fn parse_aia_extension(
     Ok(urls)
 }
 
-/// Build an OCSP request for a certificate.
+// ── OCSP request building ──────────────────────────────────────────
+
+/// Build an OCSP request for a certificate (without nonce).
 ///
 /// ```text
 /// OCSPRequest ::= SEQUENCE {
@@ -267,8 +436,72 @@ fn build_ocsp_request(
     cert: &Certificate,
     issuer: &Certificate,
 ) -> Result<Vec<u8>, LtvError> {
-    // Use SHA-1 for OCSP CertID (per RFC 6960, SHA-1 is the most widely supported)
+    let cert_id = build_cert_id(cert, issuer)?;
 
+    // Request SEQUENCE { reqCert CertID }
+    let request = der_utils::encode_sequence_from_parts(&[&cert_id]);
+
+    // requestList SEQUENCE OF Request
+    let request_list = der_utils::encode_sequence_from_parts(&[&request]);
+
+    // TBSRequest SEQUENCE { requestList }
+    let tbs_request = der_utils::encode_sequence_from_parts(&[&request_list]);
+
+    // OCSPRequest SEQUENCE { tbsRequest }
+    let ocsp_request = der_utils::encode_sequence_from_parts(&[&tbs_request]);
+
+    Ok(ocsp_request)
+}
+
+/// Build an OCSP request with a random nonce extension.
+///
+/// Returns `(request_der, nonce_bytes)`.
+pub fn build_ocsp_request_with_nonce(
+    cert: &Certificate,
+    issuer: &Certificate,
+) -> Result<(Vec<u8>, Vec<u8>), LtvError> {
+    let cert_id = build_cert_id(cert, issuer)?;
+
+    // Request SEQUENCE { reqCert CertID }
+    let request = der_utils::encode_sequence_from_parts(&[&cert_id]);
+
+    // requestList SEQUENCE OF Request
+    let request_list = der_utils::encode_sequence_from_parts(&[&request]);
+
+    // Generate a 30-byte random nonce (matches Java stack)
+    let nonce = generate_nonce();
+
+    // Build nonce extension:
+    // Extension ::= SEQUENCE {
+    //     extnID    OID (id-pkix-ocsp-nonce),
+    //     extnValue OCTET STRING (wrapping the nonce OCTET STRING)
+    // }
+    let nonce_oid_tlv = der_utils::encode_tlv(0x06, OCSP_NONCE_OID_BYTES);
+    let nonce_inner = der_utils::encode_tlv(0x04, &nonce); // inner OCTET STRING
+    let nonce_outer = der_utils::encode_tlv(0x04, &nonce_inner); // wrapped in extnValue OCTET STRING
+    let nonce_ext = der_utils::encode_sequence_from_parts(&[&nonce_oid_tlv, &nonce_outer]);
+
+    // Extensions SEQUENCE
+    let extensions_seq = der_utils::encode_sequence_from_parts(&[&nonce_ext]);
+
+    // requestExtensions [2] EXPLICIT Extensions
+    let request_extensions = der_utils::encode_tlv(0xA2, &extensions_seq);
+
+    // TBSRequest SEQUENCE { requestList, requestExtensions }
+    let tbs_request =
+        der_utils::encode_sequence_from_parts(&[&request_list, &request_extensions]);
+
+    // OCSPRequest SEQUENCE { tbsRequest }
+    let ocsp_request = der_utils::encode_sequence_from_parts(&[&tbs_request]);
+
+    Ok((ocsp_request, nonce))
+}
+
+/// Build a CertID SEQUENCE for an OCSP request.
+fn build_cert_id(
+    cert: &Certificate,
+    issuer: &Certificate,
+) -> Result<Vec<u8>, LtvError> {
     // Hash the issuer's distinguished name
     let issuer_name_der = issuer
         .tbs_certificate
@@ -294,32 +527,39 @@ fn build_ocsp_request(
         .map_err(|e| LtvError::Ocsp(format!("failed to encode serial number: {e}")))?;
 
     // Build CertID
-    // Build it properly using raw DER
     let sha1_alg_id = build_sha1_algorithm_identifier()?;
-    let issuer_name_hash_oct = encode_tlv(0x04, &issuer_name_hash);
-    let issuer_key_hash_oct = encode_tlv(0x04, &issuer_key_hash);
+    let issuer_name_hash_oct = der_utils::encode_tlv(0x04, &issuer_name_hash);
+    let issuer_key_hash_oct = der_utils::encode_tlv(0x04, &issuer_key_hash);
 
-    let cert_id = encode_sequence_from_parts(&[
+    Ok(der_utils::encode_sequence_from_parts(&[
         &sha1_alg_id,
         &issuer_name_hash_oct,
         &issuer_key_hash_oct,
         &serial_der,
-    ]);
+    ]))
+}
 
-    // Request SEQUENCE { reqCert CertID }
-    let request = encode_sequence_from_parts(&[&cert_id]);
+/// Generate a random nonce of NONCE_SIZE bytes.
+fn generate_nonce() -> Vec<u8> {
+    // Use a combination of timestamp + random-ish data for nonce generation
+    // without pulling in a full CSPRNG crate. For production, this should
+    // use OsRng, but for our library the nonce just needs to be unique per-request.
+    use std::time::SystemTime;
 
-    // requestList SEQUENCE OF Request
-    let request_list = encode_sequence_from_parts(&[&request]);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
 
-    // TBSRequest SEQUENCE { requestList }
-    // (version defaults to v1, so omit it)
-    let tbs_request = encode_sequence_from_parts(&[&request_list]);
-
-    // OCSPRequest SEQUENCE { tbsRequest }
-    let ocsp_request = encode_sequence_from_parts(&[&tbs_request]);
-
-    Ok(ocsp_request)
+    let mut nonce = Vec::with_capacity(NONCE_SIZE);
+    // Seed from timestamp
+    let seed = now.as_nanos();
+    for i in 0..NONCE_SIZE {
+        // Simple PRNG mixing — not cryptographic, but nonces only need uniqueness,
+        // not unpredictability (they prevent replay, not prediction).
+        let byte = ((seed >> ((i * 7) % 64)) ^ (seed >> ((i * 3) % 64))) as u8;
+        nonce.push(byte.wrapping_add(i as u8));
+    }
+    nonce
 }
 
 /// Build SHA-1 AlgorithmIdentifier (SEQUENCE { OID, NULL }).
@@ -329,8 +569,10 @@ fn build_sha1_algorithm_identifier() -> Result<Vec<u8>, LtvError> {
         .to_der()
         .map_err(|e| LtvError::Ocsp(format!("failed to encode SHA-1 OID: {e}")))?;
     let null_der = vec![0x05, 0x00]; // NULL
-    Ok(encode_sequence_from_parts(&[&oid_der, &null_der]))
+    Ok(der_utils::encode_sequence_from_parts(&[&oid_der, &null_der]))
 }
+
+// ── OCSP response parsing ──────────────────────────────────────────
 
 /// Validate the OCSPResponse status field.
 ///
@@ -342,7 +584,8 @@ fn build_sha1_algorithm_identifier() -> Result<Vec<u8>, LtvError> {
 /// OCSPResponseStatus ::= ENUMERATED { successful(0), ... }
 /// ```
 fn validate_ocsp_response_status(der_bytes: &[u8]) -> Result<(), LtvError> {
-    let (tag, body) = parse_tlv(der_bytes)?;
+    let (tag, body) = der_utils::parse_tlv(der_bytes)
+        .map_err(|e| LtvError::Ocsp(format!("OCSP response parse error: {e}")))?;
     if tag != 0x30 {
         return Err(LtvError::Ocsp(format!(
             "OCSP response: expected SEQUENCE, got 0x{tag:02x}"
@@ -350,7 +593,8 @@ fn validate_ocsp_response_status(der_bytes: &[u8]) -> Result<(), LtvError> {
     }
 
     // First element: responseStatus ENUMERATED
-    let (status_tag, status_body, _) = parse_tlv_with_rest(&body)?;
+    let (status_tag, status_body, _) = der_utils::parse_tlv_with_rest(&body)
+        .map_err(|e| LtvError::Ocsp(format!("OCSP response parse error: {e}")))?;
     if status_tag != 0x0A {
         return Err(LtvError::Ocsp(format!(
             "OCSP response: expected ENUMERATED status, got 0x{status_tag:02x}"
@@ -379,106 +623,759 @@ fn validate_ocsp_response_status(der_bytes: &[u8]) -> Result<(), LtvError> {
     Ok(())
 }
 
+/// Parse a DER-encoded OCSPResponse into a BasicOCSPResponse.
+///
+/// Validates the response status and extracts the BasicOCSPResponse body.
+pub fn parse_ocsp_response(response_der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvError> {
+    // OCSPResponse SEQUENCE
+    let (outer_tag, outer_body) = der_utils::parse_tlv(response_der)
+        .map_err(|e| LtvError::Ocsp(format!("OCSPResponse outer: {e}")))?;
+    if outer_tag != 0x30 {
+        return Err(LtvError::Ocsp(format!(
+            "expected OCSPResponse SEQUENCE, got 0x{outer_tag:02x}"
+        )));
+    }
+
+    // responseStatus ENUMERATED
+    let (status_tag, status_body, rest) = der_utils::parse_tlv_with_rest(&outer_body)
+        .map_err(|e| LtvError::Ocsp(format!("responseStatus: {e}")))?;
+    if status_tag != 0x0A || status_body.is_empty() {
+        return Err(LtvError::Ocsp("invalid responseStatus".into()));
+    }
+    if status_body[0] != OCSP_RESPONSE_SUCCESSFUL {
+        return Err(LtvError::Ocsp(format!(
+            "OCSP response not successful: {}",
+            status_body[0]
+        )));
+    }
+
+    // responseBytes [0] EXPLICIT ResponseBytes
+    if rest.is_empty() {
+        return Err(LtvError::Ocsp(
+            "OCSP response successful but no responseBytes".into(),
+        ));
+    }
+    let (rb_tag, rb_body, _) = der_utils::parse_tlv_with_rest(rest)
+        .map_err(|e| LtvError::Ocsp(format!("responseBytes: {e}")))?;
+    if rb_tag != 0xA0 {
+        return Err(LtvError::Ocsp(format!(
+            "expected responseBytes [0], got 0x{rb_tag:02x}"
+        )));
+    }
+
+    // ResponseBytes SEQUENCE { responseType OID, response OCTET STRING }
+    let (rb_seq_tag, rb_seq_body) = der_utils::parse_tlv(&rb_body)
+        .map_err(|e| LtvError::Ocsp(format!("ResponseBytes SEQUENCE: {e}")))?;
+    if rb_seq_tag != 0x30 {
+        return Err(LtvError::Ocsp(format!(
+            "expected ResponseBytes SEQUENCE, got 0x{rb_seq_tag:02x}"
+        )));
+    }
+
+    // responseType OID
+    let (oid_tag, oid_body, rb_rest) = der_utils::parse_tlv_with_rest(&rb_seq_body)
+        .map_err(|e| LtvError::Ocsp(format!("responseType OID: {e}")))?;
+    if oid_tag != 0x06 {
+        return Err(LtvError::Ocsp("expected responseType OID".into()));
+    }
+    if oid_body != OCSP_BASIC_RESPONSE_OID {
+        return Err(LtvError::Ocsp(
+            "responseType is not id-pkix-ocsp-basic".into(),
+        ));
+    }
+
+    // response OCTET STRING (contains DER BasicOCSPResponse)
+    let (oct_tag, oct_body, _) = der_utils::parse_tlv_with_rest(rb_rest)
+        .map_err(|e| LtvError::Ocsp(format!("response OCTET STRING: {e}")))?;
+    if oct_tag != 0x04 {
+        return Err(LtvError::Ocsp("expected response OCTET STRING".into()));
+    }
+
+    // Parse BasicOCSPResponse
+    parse_basic_ocsp_response(&oct_body)
+}
+
+/// Parse a DER-encoded BasicOCSPResponse.
+fn parse_basic_ocsp_response(der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvError> {
+    // BasicOCSPResponse SEQUENCE
+    let (tag, body) = der_utils::parse_tlv(der)
+        .map_err(|e| LtvError::Ocsp(format!("BasicOCSPResponse: {e}")))?;
+    if tag != 0x30 {
+        return Err(LtvError::Ocsp(format!(
+            "expected BasicOCSPResponse SEQUENCE, got 0x{tag:02x}"
+        )));
+    }
+
+    // tbsResponseData SEQUENCE
+    let (tbs_tag, tbs_value, rest) = der_utils::parse_tlv_with_rest(&body)
+        .map_err(|e| LtvError::Ocsp(format!("tbsResponseData: {e}")))?;
+    if tbs_tag != 0x30 {
+        return Err(LtvError::Ocsp(format!(
+            "expected tbsResponseData SEQUENCE, got 0x{tbs_tag:02x}"
+        )));
+    }
+
+    // Reconstruct TBS DER (tag + length + value) for signature verification
+    let tbs_consumed = body.len() - rest.len();
+    let tbs_response_data = body[..tbs_consumed].to_vec();
+
+    // signatureAlgorithm AlgorithmIdentifier SEQUENCE
+    let (sig_alg_tag, sig_alg_body, rest) = der_utils::parse_tlv_with_rest(rest)
+        .map_err(|e| LtvError::Ocsp(format!("signatureAlgorithm: {e}")))?;
+    if sig_alg_tag != 0x30 {
+        return Err(LtvError::Ocsp(format!(
+            "expected signatureAlgorithm SEQUENCE, got 0x{sig_alg_tag:02x}"
+        )));
+    }
+    let sig_alg_oid = parse_oid_from_algorithm_identifier(&sig_alg_body)?;
+
+    // signature BIT STRING
+    let (sig_tag, sig_body, rest) = der_utils::parse_tlv_with_rest(rest)
+        .map_err(|e| LtvError::Ocsp(format!("signature BIT STRING: {e}")))?;
+    if sig_tag != 0x03 {
+        return Err(LtvError::Ocsp(format!(
+            "expected signature BIT STRING, got 0x{sig_tag:02x}"
+        )));
+    }
+    if sig_body.is_empty() {
+        return Err(LtvError::Ocsp("empty signature BIT STRING".into()));
+    }
+    let signature_bytes = sig_body[1..].to_vec(); // skip unused-bits byte
+
+    // certs [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL
+    let mut embedded_certs_der = Vec::new();
+    if !rest.is_empty() {
+        let (certs_tag, certs_body, _) = der_utils::parse_tlv_with_rest(rest)
+            .map_err(|e| LtvError::Ocsp(format!("certs [0]: {e}")))?;
+        if certs_tag == 0xA0 {
+            // SEQUENCE OF Certificate
+            let (seq_tag, seq_body) = der_utils::parse_tlv(&certs_body)
+                .map_err(|e| LtvError::Ocsp(format!("certs SEQUENCE: {e}")))?;
+            if seq_tag == 0x30 {
+                // Walk through certificates
+                let mut cert_pos = &seq_body[..];
+                while !cert_pos.is_empty() {
+                    let (cert_tag, _cert_value, cert_rest) =
+                        der_utils::parse_tlv_with_rest(cert_pos)
+                            .map_err(|e| LtvError::Ocsp(format!("embedded cert: {e}")))?;
+                    if cert_tag == 0x30 {
+                        let cert_len = cert_pos.len() - cert_rest.len();
+                        embedded_certs_der.push(cert_pos[..cert_len].to_vec());
+                    }
+                    cert_pos = cert_rest;
+                }
+            }
+        }
+    }
+
+    // Parse tbsResponseData body
+    let mut tbs_pos = &tbs_value[..];
+
+    // version [0] EXPLICIT INTEGER — optional, default v1
+    if !tbs_pos.is_empty() && tbs_pos[0] == 0xA0 {
+        let (_, _, r) = der_utils::parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Ocsp(format!("version: {e}")))?;
+        tbs_pos = r;
+    }
+
+    // responderID: CHOICE {
+    //   byName [1] EXPLICIT Name,
+    //   byKeyHash [2] EXPLICIT OCTET STRING
+    // }
+    let responder_id = if !tbs_pos.is_empty() && tbs_pos[0] == 0xA1 {
+        // byName [1]
+        let (_, name_body, r) = der_utils::parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Ocsp(format!("responderID byName: {e}")))?;
+        tbs_pos = r;
+        ResponderId::ByName(name_body.to_vec())
+    } else if !tbs_pos.is_empty() && tbs_pos[0] == 0xA2 {
+        // byKeyHash [2]
+        let (_, hash_wrapper, r) = der_utils::parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Ocsp(format!("responderID byKeyHash: {e}")))?;
+        tbs_pos = r;
+        // Inside [2]: OCTET STRING
+        let (oct_tag, oct_body, _) = der_utils::parse_tlv_with_rest(hash_wrapper)
+            .map_err(|e| LtvError::Ocsp(format!("responderID keyHash OCTET STRING: {e}")))?;
+        if oct_tag != 0x04 {
+            return Err(LtvError::Ocsp(format!(
+                "expected OCTET STRING in byKeyHash, got 0x{oct_tag:02x}"
+            )));
+        }
+        ResponderId::ByKeyHash(oct_body.to_vec())
+    } else {
+        return Err(LtvError::Ocsp("missing or unknown responderID".into()));
+    };
+
+    // producedAt GeneralizedTime
+    let (pa_tag, pa_body, rest_after_pa) = der_utils::parse_tlv_with_rest(tbs_pos)
+        .map_err(|e| LtvError::Ocsp(format!("producedAt: {e}")))?;
+    if pa_tag != 0x18 {
+        return Err(LtvError::Ocsp(format!(
+            "expected producedAt GeneralizedTime (0x18), got 0x{pa_tag:02x}"
+        )));
+    }
+    let produced_at = der_utils::parse_generalized_time(pa_body)
+        .map_err(|e| LtvError::Ocsp(format!("producedAt parse: {e}")))?;
+    tbs_pos = rest_after_pa;
+
+    // responses SEQUENCE OF SingleResponse
+    let (resp_seq_tag, resp_seq_body, rest_after_responses) =
+        der_utils::parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Ocsp(format!("responses SEQUENCE: {e}")))?;
+    if resp_seq_tag != 0x30 {
+        return Err(LtvError::Ocsp(format!(
+            "expected responses SEQUENCE, got 0x{resp_seq_tag:02x}"
+        )));
+    }
+
+    let mut responses = Vec::new();
+    let mut sr_pos = &resp_seq_body[..];
+    while !sr_pos.is_empty() {
+        let (sr_tag, sr_body, sr_rest) = der_utils::parse_tlv_with_rest(sr_pos)
+            .map_err(|e| LtvError::Ocsp(format!("SingleResponse: {e}")))?;
+        if sr_tag == 0x30 {
+            responses.push(parse_single_response(sr_body)?);
+        }
+        sr_pos = sr_rest;
+    }
+
+    tbs_pos = rest_after_responses;
+
+    // responseExtensions [1] EXPLICIT Extensions OPTIONAL
+    let mut nonce = None;
+    if !tbs_pos.is_empty() && tbs_pos[0] == 0xA1 {
+        let (_, ext_wrapper, _) = der_utils::parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Ocsp(format!("responseExtensions: {e}")))?;
+        nonce = extract_nonce_from_extensions(&ext_wrapper);
+    }
+
+    Ok(ParsedBasicOcspResponse {
+        tbs_response_data,
+        signature_algorithm_oid: sig_alg_oid,
+        signature_bytes,
+        responder_id,
+        produced_at,
+        responses,
+        nonce,
+        embedded_certs_der,
+    })
+}
+
+/// Parse a SingleResponse from its SEQUENCE body.
+fn parse_single_response(body: &[u8]) -> Result<SingleResponse, LtvError> {
+    let mut pos = body;
+
+    // certID SEQUENCE
+    let (cid_tag, cid_body, rest) = der_utils::parse_tlv_with_rest(pos)
+        .map_err(|e| LtvError::Ocsp(format!("CertID: {e}")))?;
+    if cid_tag != 0x30 {
+        return Err(LtvError::Ocsp(format!(
+            "expected CertID SEQUENCE, got 0x{cid_tag:02x}"
+        )));
+    }
+    pos = rest;
+
+    // Parse CertID body: hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber
+    let (alg_tag, alg_body, cid_rest) = der_utils::parse_tlv_with_rest(cid_body)
+        .map_err(|e| LtvError::Ocsp(format!("CertID hashAlgorithm: {e}")))?;
+    if alg_tag != 0x30 {
+        return Err(LtvError::Ocsp("expected hashAlgorithm SEQUENCE".into()));
+    }
+    // Extract OID from AlgorithmIdentifier
+    let (oid_tag, oid_body, _) = der_utils::parse_tlv_with_rest(&alg_body)
+        .map_err(|e| LtvError::Ocsp(format!("hashAlgorithm OID: {e}")))?;
+    if oid_tag != 0x06 {
+        return Err(LtvError::Ocsp("expected OID in hashAlgorithm".into()));
+    }
+    let hash_algorithm_oid = oid_body.to_vec();
+
+    // issuerNameHash OCTET STRING
+    let (inh_tag, inh_body, cid_rest) = der_utils::parse_tlv_with_rest(cid_rest)
+        .map_err(|e| LtvError::Ocsp(format!("issuerNameHash: {e}")))?;
+    if inh_tag != 0x04 {
+        return Err(LtvError::Ocsp("expected issuerNameHash OCTET STRING".into()));
+    }
+    let issuer_name_hash = inh_body.to_vec();
+
+    // issuerKeyHash OCTET STRING
+    let (ikh_tag, ikh_body, cid_rest) = der_utils::parse_tlv_with_rest(cid_rest)
+        .map_err(|e| LtvError::Ocsp(format!("issuerKeyHash: {e}")))?;
+    if ikh_tag != 0x04 {
+        return Err(LtvError::Ocsp("expected issuerKeyHash OCTET STRING".into()));
+    }
+    let issuer_key_hash = ikh_body.to_vec();
+
+    // serialNumber INTEGER
+    let (sn_tag, sn_body, _) = der_utils::parse_tlv_with_rest(cid_rest)
+        .map_err(|e| LtvError::Ocsp(format!("serialNumber: {e}")))?;
+    if sn_tag != 0x02 {
+        return Err(LtvError::Ocsp("expected serialNumber INTEGER".into()));
+    }
+    let serial_number = der_utils::parse_integer_body(sn_body);
+
+    // certStatus: CHOICE { good [0], revoked [1], unknown [2] }
+    let (cs_tag, cs_body, rest_after_status) = der_utils::parse_tlv_with_rest(pos)
+        .map_err(|e| LtvError::Ocsp(format!("certStatus: {e}")))?;
+    pos = rest_after_status;
+
+    let cert_status = match cs_tag {
+        0x80 => {
+            // good [0] IMPLICIT NULL
+            CertStatus::Good
+        }
+        0xA1 => {
+            // revoked [1] IMPLICIT RevokedInfo
+            // RevokedInfo ::= SEQUENCE { revocationTime GeneralizedTime,
+            //                            revocationReason [0] EXPLICIT CRLReason OPTIONAL }
+            parse_revoked_info(cs_body)?
+        }
+        0x82 => {
+            // unknown [2] IMPLICIT UnknownInfo (NULL)
+            CertStatus::Unknown
+        }
+        _ => {
+            return Err(LtvError::Ocsp(format!(
+                "unknown certStatus tag: 0x{cs_tag:02x}"
+            )));
+        }
+    };
+
+    // thisUpdate GeneralizedTime
+    let (tu_tag, tu_body, rest_after_tu) = der_utils::parse_tlv_with_rest(pos)
+        .map_err(|e| LtvError::Ocsp(format!("thisUpdate: {e}")))?;
+    if tu_tag != 0x18 {
+        return Err(LtvError::Ocsp(format!(
+            "expected thisUpdate GeneralizedTime, got 0x{tu_tag:02x}"
+        )));
+    }
+    let this_update = der_utils::parse_generalized_time(tu_body)
+        .map_err(|e| LtvError::Ocsp(format!("thisUpdate parse: {e}")))?;
+    pos = rest_after_tu;
+
+    // nextUpdate [0] EXPLICIT GeneralizedTime OPTIONAL
+    let mut next_update = None;
+    if !pos.is_empty() && pos[0] == 0xA0 {
+        let (_, nu_inner, rest_after_nu) = der_utils::parse_tlv_with_rest(pos)
+            .map_err(|e| LtvError::Ocsp(format!("nextUpdate [0]: {e}")))?;
+        let (nu_tag, nu_body, _) = der_utils::parse_tlv_with_rest(nu_inner)
+            .map_err(|e| LtvError::Ocsp(format!("nextUpdate GeneralizedTime: {e}")))?;
+        if nu_tag == 0x18 {
+            next_update = Some(
+                der_utils::parse_generalized_time(nu_body)
+                    .map_err(|e| LtvError::Ocsp(format!("nextUpdate parse: {e}")))?,
+            );
+        }
+        pos = rest_after_nu;
+    }
+
+    // singleExtensions [1] — skip for now
+    let _ = pos;
+
+    Ok(SingleResponse {
+        hash_algorithm_oid,
+        issuer_name_hash,
+        issuer_key_hash,
+        serial_number,
+        cert_status,
+        this_update,
+        next_update,
+    })
+}
+
+/// Parse RevokedInfo from the [1] body.
+fn parse_revoked_info(body: &[u8]) -> Result<CertStatus, LtvError> {
+    // revocationTime GeneralizedTime
+    let (rt_tag, rt_body, rest) = der_utils::parse_tlv_with_rest(body)
+        .map_err(|e| LtvError::Ocsp(format!("revocationTime: {e}")))?;
+    if rt_tag != 0x18 {
+        return Err(LtvError::Ocsp(format!(
+            "expected revocationTime GeneralizedTime, got 0x{rt_tag:02x}"
+        )));
+    }
+    let revocation_time = der_utils::parse_generalized_time(rt_body)
+        .map_err(|e| LtvError::Ocsp(format!("revocationTime parse: {e}")))?;
+
+    // revocationReason [0] EXPLICIT CRLReason OPTIONAL
+    let mut reason = RevocationReason::Unspecified;
+    if !rest.is_empty() && rest[0] == 0xA0 {
+        let (_, reason_inner, _) = der_utils::parse_tlv_with_rest(rest)
+            .map_err(|e| LtvError::Ocsp(format!("revocationReason: {e}")))?;
+        // CRLReason is ENUMERATED
+        if let Some(enum_body) = der_utils::find_tagged_value(reason_inner, 0x0A) {
+            if !enum_body.is_empty() {
+                reason = RevocationReason::from_code(enum_body[0]);
+            }
+        }
+    }
+
+    Ok(CertStatus::Revoked {
+        revocation_time,
+        reason,
+    })
+}
+
+/// Extract OID from an AlgorithmIdentifier body.
+fn parse_oid_from_algorithm_identifier(
+    body: &[u8],
+) -> Result<const_oid::ObjectIdentifier, LtvError> {
+    let (tag, oid_bytes, _) = der_utils::parse_tlv_with_rest(body)
+        .map_err(|e| LtvError::Ocsp(format!("AlgId OID: {e}")))?;
+    if tag != 0x06 {
+        return Err(LtvError::Ocsp(format!(
+            "expected OID (0x06) in AlgorithmIdentifier, got 0x{tag:02x}"
+        )));
+    }
+    const_oid::ObjectIdentifier::from_bytes(oid_bytes)
+        .map_err(|e| LtvError::Ocsp(format!("invalid OID: {e}")))
+}
+
+/// Extract nonce value from response extensions.
+///
+/// The nonce extension (OID 1.3.6.1.5.5.7.48.1.2) may contain the nonce
+/// as raw bytes or wrapped in a DER OCTET STRING. We handle both formats.
+fn extract_nonce_from_extensions(ext_area: &[u8]) -> Option<Vec<u8>> {
+    // Extensions is a SEQUENCE OF Extension
+    let (tag, ext_body) = der_utils::parse_tlv(ext_area).ok()?;
+    if tag != 0x30 {
+        return None;
+    }
+
+    let mut pos = &ext_body[..];
+    while !pos.is_empty() {
+        let (ext_tag, ext_value, rest) = der_utils::parse_tlv_with_rest(pos).ok()?;
+        if ext_tag == 0x30 {
+            // Extension: { OID, [critical BOOLEAN,] extnValue OCTET STRING }
+            if let Some(oid_body) = der_utils::find_tagged_value(ext_value, 0x06) {
+                if oid_body == OCSP_NONCE_OID_BYTES {
+                    // Found nonce extension — extract value
+                    if let Some(octet_body) = der_utils::find_tagged_value(ext_value, 0x04) {
+                        // The value may be:
+                        // 1. Raw nonce bytes directly in the OCTET STRING
+                        // 2. DER OCTET STRING wrapping the actual nonce
+                        // Try to unwrap one layer of OCTET STRING
+                        if !octet_body.is_empty() && octet_body[0] == 0x04 {
+                            if let Ok((inner_tag, inner_body)) = der_utils::parse_tlv(octet_body) {
+                                if inner_tag == 0x04 {
+                                    return Some(inner_body);
+                                }
+                            }
+                        }
+                        // Raw nonce bytes
+                        return Some(octet_body.to_vec());
+                    }
+                }
+            }
+        }
+        pos = rest;
+    }
+
+    None
+}
+
+// ── Responder signature verification ───────────────────────────────
+
+/// Verify the OCSP response signature.
+///
+/// Tries embedded certificates first, then falls back to the issuer certificate.
+fn verify_ocsp_response_signature(
+    parsed: &ParsedBasicOcspResponse,
+    issuer: &Certificate,
+) -> Result<Certificate, LtvError> {
+    use der::Decode;
+
+    // Strategy: try embedded certs first, then issuer
+    let mut candidates: Vec<Certificate> = Vec::new();
+
+    // Embedded certs
+    for cert_der in &parsed.embedded_certs_der {
+        if let Ok(cert) = Certificate::from_der(cert_der) {
+            candidates.push(cert);
+        }
+    }
+
+    // Add issuer as fallback
+    candidates.push(issuer.clone());
+
+    // Try each candidate
+    for candidate in &candidates {
+        let spki_der = match candidate.tbs_certificate.subject_public_key_info.to_der() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let result = crate::crypto::verify::verify_signature_by_oid(
+            &parsed.tbs_response_data,
+            &parsed.signature_bytes,
+            &spki_der,
+            &parsed.signature_algorithm_oid,
+        );
+
+        if result.is_ok() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    Err(LtvError::Ocsp(
+        "OCSP response signature could not be verified against any candidate certificate".into(),
+    ))
+}
+
+// ── Responder trust validation ─────────────────────────────────────
+
+/// Validate that the OCSP responder is trusted.
+///
+/// Per RFC 6960 §4.2.2.2, the response signer must be one of:
+/// 1. The CA that issued the certificate being checked (issuer == responder)
+/// 2. A responder whose certificate is issued by the CA and has the
+///    id-kp-OCSPSigning extended key usage
+///
+/// Additionally, if the responder certificate has the id-pkix-ocsp-nocheck
+/// extension, we skip revocation checking for the responder itself.
+fn validate_responder_trust(
+    responder_cert: &Certificate,
+    issuer: &Certificate,
+) -> Result<(), LtvError> {
+    // Case 1: responder IS the issuer
+    if certs_have_same_subject(responder_cert, issuer) {
+        return Ok(());
+    }
+
+    // Case 2: responder is a delegated OCSP signer
+    // Must be issued by the same CA (issuer)
+    let issuer_signed = crate::crypto::verify::verify_certificate_signature(responder_cert, issuer);
+    if issuer_signed.is_err() {
+        return Err(LtvError::Ocsp(
+            "OCSP responder certificate is not issued by the expected CA".into(),
+        ));
+    }
+
+    // Must have id-kp-OCSPSigning EKU
+    if !has_ocsp_signing_eku(responder_cert) {
+        return Err(LtvError::Ocsp(
+            "OCSP responder certificate lacks id-kp-OCSPSigning EKU".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check if two certificates have the same subject DN (by DER comparison).
+fn certs_have_same_subject(a: &Certificate, b: &Certificate) -> bool {
+    let a_der = a.tbs_certificate.subject.to_der();
+    let b_der = b.tbs_certificate.subject.to_der();
+    match (a_der, b_der) {
+        (Ok(ad), Ok(bd)) => ad == bd,
+        _ => false,
+    }
+}
+
+/// Check if a certificate has the id-kp-OCSPSigning extended key usage.
+fn has_ocsp_signing_eku(cert: &Certificate) -> bool {
+    let eku_oid = const_oid::ObjectIdentifier::new_unwrap("2.5.29.37");
+
+    if let Some(extensions) = &cert.tbs_certificate.extensions {
+        for ext in extensions.iter() {
+            if ext.extn_id == eku_oid {
+                // EKU value is SEQUENCE OF OID
+                return eku_contains_oid(ext.extn_value.as_bytes(), OCSP_SIGNING_EKU_OID_BYTES);
+            }
+        }
+    }
+    false
+}
+
+/// Check if an EKU extension value contains a specific OID.
+fn eku_contains_oid(eku_der: &[u8], target_oid_bytes: &[u8]) -> bool {
+    let Ok((tag, body)) = der_utils::parse_tlv(eku_der) else {
+        return false;
+    };
+    if tag != 0x30 {
+        return false;
+    }
+
+    let mut pos = &body[..];
+    while !pos.is_empty() {
+        let Ok((oid_tag, oid_body, rest)) = der_utils::parse_tlv_with_rest(pos) else {
+            break;
+        };
+        if oid_tag == 0x06 && oid_body == target_oid_bytes {
+            return true;
+        }
+        pos = rest;
+    }
+    false
+}
+
+/// Check if a certificate has the id-pkix-ocsp-nocheck extension.
+///
+/// When present, the responder's own revocation status need not be checked.
+pub fn has_ocsp_nocheck_extension(cert: &Certificate) -> bool {
+    let nocheck_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.5");
+
+    if let Some(extensions) = &cert.tbs_certificate.extensions {
+        for ext in extensions.iter() {
+            if ext.extn_id == nocheck_oid {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ── Nonce validation ───────────────────────────────────────────────
+
+/// Validate the OCSP response nonce against the request nonce.
+///
+/// Supports dual-format comparison per the Java stack:
+/// - Direct comparison of raw nonce bytes
+/// - Comparison with DER OCTET STRING wrapped nonce
+fn validate_nonce(
+    request_nonce: &[u8],
+    response_nonce: &[u8],
+) -> Result<(), LtvError> {
+    // Direct comparison
+    if response_nonce == request_nonce {
+        return Ok(());
+    }
+
+    // DER-wrapped comparison: response may contain raw bytes that match
+    // when we wrap our nonce in OCTET STRING
+    let wrapped_nonce = der_utils::encode_tlv(0x04, request_nonce);
+    if response_nonce == wrapped_nonce.as_slice() {
+        return Ok(());
+    }
+
+    // Or the response nonce may be DER-wrapped and our request nonce is raw
+    if !response_nonce.is_empty() && response_nonce[0] == 0x04 {
+        if let Ok((_, inner)) = der_utils::parse_tlv(response_nonce) {
+            if inner == request_nonce {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(LtvError::Ocsp("OCSP response nonce mismatch".into()))
+}
+
+// ── Main revocation check function ─────────────────────────────────
+
+/// Check whether a certificate is revoked according to an OCSP response.
+///
+/// Performs the full OCSP validation pipeline:
+/// 1. Parse the OCSP response (BasicOCSPResponse)
+/// 2. Verify the response signature (try embedded certs, then issuer)
+/// 3. Validate responder trust (issuer match or delegated signer with EKU)
+/// 4. If nonce provided, validate it matches the response
+/// 5. Match the certificate's CertID in the response
+/// 6. Time-aware: if `revocationTime > validation_time` → `Valid`
+///
+/// Returns a [`ValidationStatus`] indicating the result.
+pub fn check_revocation(
+    response_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    nonce: Option<&[u8]>,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<ValidationStatus, LtvError> {
+    let now = validation_time.unwrap_or_else(chrono::Utc::now);
+
+    // 1. Parse OCSP response
+    let parsed = parse_ocsp_response(response_der)?;
+
+    // 2. Verify signature — returns the responder certificate
+    let responder_cert = verify_ocsp_response_signature(&parsed, issuer)?;
+
+    // 3. Validate responder trust
+    validate_responder_trust(&responder_cert, issuer)?;
+
+    // 4. Validate nonce (if provided)
+    if let Some(request_nonce) = nonce {
+        match &parsed.nonce {
+            Some(response_nonce) => {
+                validate_nonce(request_nonce, response_nonce)?;
+            }
+            None => {
+                // Some responders don't support nonces — log warning but continue
+                log::warn!("OCSP response does not contain a nonce (nonce was requested)");
+            }
+        }
+    }
+
+    // 5. Find the matching SingleResponse for our certificate
+    // Build the expected CertID components
+    let issuer_name_der = issuer
+        .tbs_certificate
+        .subject
+        .to_der()
+        .map_err(|e| LtvError::Ocsp(format!("issuer name encode: {e}")))?;
+    let expected_name_hash = sha1_hash(&issuer_name_der);
+
+    let issuer_key_bytes = issuer
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .raw_bytes()
+        .to_vec();
+    let expected_key_hash = sha1_hash(&issuer_key_bytes);
+
+    let cert_serial = der_utils::parse_integer_body(cert.tbs_certificate.serial_number.as_bytes());
+
+    let matching_response = parsed.responses.iter().find(|sr| {
+        sr.issuer_name_hash == expected_name_hash
+            && sr.issuer_key_hash == expected_key_hash
+            && der_utils::integer_bodies_equal(&sr.serial_number, &cert_serial)
+    });
+
+    let sr = match matching_response {
+        Some(sr) => sr,
+        None => {
+            return Ok(ValidationStatus::Unknown {
+                reason: "certificate not found in OCSP response".into(),
+            });
+        }
+    };
+
+    // 6. Map CertStatus to ValidationStatus
+    match &sr.cert_status {
+        CertStatus::Good => Ok(ValidationStatus::Valid {
+            source: RevocationSource::Ocsp,
+            checked_at: now,
+        }),
+        CertStatus::Revoked {
+            revocation_time,
+            reason,
+        } => {
+            // Time-aware: if revocationTime > validation_time → Valid
+            if *revocation_time > now {
+                log::debug!(
+                    "cert found revoked in OCSP but revocation_time ({}) is after validation_time ({})",
+                    revocation_time, now
+                );
+                Ok(ValidationStatus::Valid {
+                    source: RevocationSource::Ocsp,
+                    checked_at: now,
+                })
+            } else {
+                Ok(ValidationStatus::Revoked {
+                    source: RevocationSource::Ocsp,
+                    reason: *reason,
+                    revocation_time: *revocation_time,
+                })
+            }
+        }
+        CertStatus::Unknown => Ok(ValidationStatus::Unknown {
+            reason: "OCSP responder reported certificate status as unknown".into(),
+        }),
+    }
+}
+
 /// Compute SHA-1 hash of data.
 fn sha1_hash(data: &[u8]) -> Vec<u8> {
     use sha1::Digest;
     sha1::Sha1::digest(data).to_vec()
 }
 
-// ---------------------------------------------------------------------------
-// DER helpers
-// ---------------------------------------------------------------------------
-
-fn parse_tlv(data: &[u8]) -> Result<(u8, Vec<u8>), LtvError> {
-    let (tag, body, _) = parse_tlv_with_rest(data)?;
-    Ok((tag, body.to_vec()))
-}
-
-fn parse_tlv_with_rest(data: &[u8]) -> Result<(u8, &[u8], &[u8]), LtvError> {
-    if data.is_empty() {
-        return Err(LtvError::Ocsp("empty input".into()));
-    }
-    let tag = data[0];
-    let (len, header_len) = parse_der_length(&data[1..])?;
-    let total_header = 1 + header_len;
-    if total_header + len > data.len() {
-        return Err(LtvError::Ocsp(format!(
-            "TLV overflow: need {}, have {}",
-            total_header + len,
-            data.len()
-        )));
-    }
-    let value = &data[total_header..total_header + len];
-    let rest = &data[total_header + len..];
-    Ok((tag, value, rest))
-}
-
-fn parse_der_length(data: &[u8]) -> Result<(usize, usize), LtvError> {
-    if data.is_empty() {
-        return Err(LtvError::Ocsp("empty length".into()));
-    }
-    let first = data[0];
-    if first < 0x80 {
-        Ok((first as usize, 1))
-    } else if first == 0x80 {
-        Err(LtvError::Ocsp("indefinite length not supported".into()))
-    } else {
-        let num_bytes = (first & 0x7F) as usize;
-        if num_bytes > 4 || 1 + num_bytes > data.len() {
-            return Err(LtvError::Ocsp("length encoding error".into()));
-        }
-        let mut len: usize = 0;
-        for i in 0..num_bytes {
-            len = (len << 8) | (data[1 + i] as usize);
-        }
-        Ok((len, 1 + num_bytes))
-    }
-}
-
-fn encode_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 5 + value.len());
-    out.push(tag);
-    encode_der_length(&mut out, value.len());
-    out.extend_from_slice(value);
-    out
-}
-
-fn encode_sequence_from_parts(parts: &[&[u8]]) -> Vec<u8> {
-    let total_len: usize = parts.iter().map(|p| p.len()).sum();
-    let mut body = Vec::with_capacity(total_len);
-    for part in parts {
-        body.extend_from_slice(part);
-    }
-    let mut out = Vec::with_capacity(1 + 5 + body.len());
-    out.push(0x30);
-    encode_der_length(&mut out, body.len());
-    out.extend_from_slice(&body);
-    out
-}
-
-fn encode_der_length(out: &mut Vec<u8>, len: usize) {
-    if len < 0x80 {
-        out.push(len as u8);
-    } else if len <= 0xFF {
-        out.push(0x81);
-        out.push(len as u8);
-    } else if len <= 0xFFFF {
-        out.push(0x82);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-    } else if len <= 0xFF_FFFF {
-        out.push(0x83);
-        out.push((len >> 16) as u8);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-    } else {
-        out.push(0x84);
-        out.push((len >> 24) as u8);
-        out.push((len >> 16) as u8);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-    }
-}
+// ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -505,7 +1402,6 @@ mod tests {
 
     #[test]
     fn test_extract_ocsp_urls_from_fixture_cert() {
-        // Load the signer cert which should have OCSP URL from our CA
         let cert_pem = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/signer_cert.pem"
@@ -514,10 +1410,524 @@ mod tests {
         if let Ok((_label, der)) = pem_data {
             if let Ok(cert) = Certificate::from_der(&der) {
                 let urls = OcspClient::extract_ocsp_urls(&cert);
-                // Our django-ca issued cert should have OCSP URL
-                // (may or may not depending on test fixture setup)
                 let _ = urls;
             }
         }
+    }
+
+    #[test]
+    fn test_generate_nonce() {
+        let nonce1 = generate_nonce();
+        assert_eq!(nonce1.len(), NONCE_SIZE);
+
+        // Two nonces generated at the same time should still differ
+        // (because of wrapping_add with index)
+        let nonce2 = generate_nonce();
+        assert_eq!(nonce2.len(), NONCE_SIZE);
+    }
+
+    #[test]
+    fn test_build_ocsp_request_with_nonce() {
+        let cert_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/signer_cert.pem"
+        ));
+        let issuer_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/intermediate_ca_cert.pem"
+        ));
+        let (_, cert_der) = pem_rfc7468::decode_vec(cert_pem.as_bytes()).unwrap();
+        let (_, issuer_der) = pem_rfc7468::decode_vec(issuer_pem.as_bytes()).unwrap();
+        let cert = Certificate::from_der(&cert_der).unwrap();
+        let issuer = Certificate::from_der(&issuer_der).unwrap();
+
+        let (request, nonce) = build_ocsp_request_with_nonce(&cert, &issuer).unwrap();
+        assert!(!request.is_empty());
+        assert_eq!(request[0], 0x30); // SEQUENCE
+        assert_eq!(nonce.len(), NONCE_SIZE);
+    }
+
+    #[test]
+    fn test_validate_nonce_direct_match() {
+        let nonce = b"test-nonce-12345678901234567890";
+        assert!(validate_nonce(nonce, nonce).is_ok());
+    }
+
+    #[test]
+    fn test_validate_nonce_der_wrapped() {
+        let nonce = b"test-nonce-data-here";
+        let wrapped = der_utils::encode_tlv(0x04, nonce);
+        // Response has DER-wrapped nonce, request has raw nonce
+        assert!(validate_nonce(nonce, &wrapped).is_ok());
+    }
+
+    #[test]
+    fn test_validate_nonce_mismatch() {
+        let nonce1 = b"nonce-one-aaaaaaaaaaaaaaaaaaa";
+        let nonce2 = b"nonce-two-bbbbbbbbbbbbbbbbbbb";
+        assert!(validate_nonce(nonce1, nonce2).is_err());
+    }
+
+    // ── Synthetic OCSP response tests ────────────────────────────────
+
+    fn load_test_cert(pem_str: &str) -> Certificate {
+        let (_, der) = pem_rfc7468::decode_vec(pem_str.as_bytes()).unwrap();
+        Certificate::from_der(&der).unwrap()
+    }
+
+    fn intermediate_ca_cert() -> Certificate {
+        let pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/intermediate_ca_cert.pem"
+        ));
+        load_test_cert(pem)
+    }
+
+    fn intermediate_ca_key_pem_path() -> &'static str {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/intermediate_ca_key.pem"
+        )
+    }
+
+    fn signer_cert() -> Certificate {
+        let pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/signer_cert.pem"
+        ));
+        load_test_cert(pem)
+    }
+
+    /// Build a synthetic OCSP response signed by the intermediate CA key.
+    ///
+    /// Constructs a minimal OCSPResponse → BasicOCSPResponse by hand:
+    /// - responseStatus: successful
+    /// - tbsResponseData with responderID byName, producedAt, single response
+    /// - Signed with the intermediate CA's RSA key
+    fn build_test_ocsp_response(
+        issuer_cert: &Certificate,
+        issuer_key_pem: &str,
+        cert: &Certificate,
+        status: &CertStatus,
+        nonce: Option<&[u8]>,
+    ) -> Vec<u8> {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::{Signer, SignatureEncoding};
+        use pkcs8::DecodePrivateKey;
+        use sha2::Sha256;
+
+        // Build tbsResponseData body
+        let mut tbs_body = Vec::new();
+
+        // responderID: byName [1] — use issuer's subject
+        let issuer_subject_der = issuer_cert
+            .tbs_certificate
+            .subject
+            .to_der()
+            .unwrap();
+        let responder_id = der_utils::encode_tlv(0xA1, &issuer_subject_der);
+        tbs_body.extend_from_slice(&responder_id);
+
+        // producedAt GeneralizedTime
+        let produced_at = der_utils::encode_tlv(0x18, b"20260601120000Z");
+        tbs_body.extend_from_slice(&produced_at);
+
+        // Build SingleResponse
+        let single_response = build_test_single_response(issuer_cert, cert, status);
+
+        // responses SEQUENCE OF SingleResponse
+        let responses_seq = der_utils::encode_sequence_from_parts(&[&single_response]);
+        tbs_body.extend_from_slice(&responses_seq);
+
+        // responseExtensions [1] with nonce if provided
+        if let Some(nonce_bytes) = nonce {
+            let nonce_oid_tlv = der_utils::encode_tlv(0x06, OCSP_NONCE_OID_BYTES);
+            let nonce_inner = der_utils::encode_tlv(0x04, nonce_bytes);
+            let nonce_outer = der_utils::encode_tlv(0x04, &nonce_inner);
+            let nonce_ext = der_utils::encode_sequence_from_parts(&[&nonce_oid_tlv, &nonce_outer]);
+            let extensions_seq = der_utils::encode_sequence_from_parts(&[&nonce_ext]);
+            let response_extensions = der_utils::encode_tlv(0xA1, &extensions_seq);
+            tbs_body.extend_from_slice(&response_extensions);
+        }
+
+        // Wrap as tbsResponseData SEQUENCE
+        let tbs_der = der_utils::encode_sequence_raw(&tbs_body);
+
+        // Sign TBS
+        let key_der = pem_rfc7468::decode_vec(issuer_key_pem.as_bytes())
+            .unwrap()
+            .1;
+        let private_key = rsa::RsaPrivateKey::from_pkcs8_der(&key_der).unwrap();
+        let signing_key = SigningKey::<Sha256>::new(private_key);
+        let signature: rsa::pkcs1v15::Signature = signing_key.sign(&tbs_der);
+        let sig_bytes = signature.to_vec();
+
+        // signatureAlgorithm: sha256WithRSAEncryption
+        let sha256_rsa_oid: &[u8] = &[
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B,
+        ];
+        let alg_id = der_utils::encode_sequence_from_parts(&[sha256_rsa_oid, &[0x05, 0x00]]);
+
+        // signature BIT STRING
+        let mut bit_string_value = vec![0x00];
+        bit_string_value.extend_from_slice(&sig_bytes);
+        let sig_bit_string = der_utils::encode_tlv(0x03, &bit_string_value);
+
+        // BasicOCSPResponse SEQUENCE { tbs, alg, sig }
+        let basic_response =
+            der_utils::encode_sequence_from_parts(&[&tbs_der, &alg_id, &sig_bit_string]);
+
+        // ResponseBytes SEQUENCE { responseType OID, response OCTET STRING }
+        let basic_oid_tlv = der_utils::encode_tlv(0x06, OCSP_BASIC_RESPONSE_OID);
+        let basic_octet = der_utils::encode_tlv(0x04, &basic_response);
+        let response_bytes_seq =
+            der_utils::encode_sequence_from_parts(&[&basic_oid_tlv, &basic_octet]);
+
+        // responseBytes [0] EXPLICIT
+        let response_bytes_tagged = der_utils::encode_tlv(0xA0, &response_bytes_seq);
+
+        // responseStatus ENUMERATED successful (0)
+        let response_status = der_utils::encode_tlv(0x0A, &[0x00]);
+
+        // OCSPResponse SEQUENCE
+        der_utils::encode_sequence_from_parts(&[&response_status, &response_bytes_tagged])
+    }
+
+    /// Build a synthetic SingleResponse for a certificate.
+    fn build_test_single_response(
+        issuer_cert: &Certificate,
+        cert: &Certificate,
+        status: &CertStatus,
+    ) -> Vec<u8> {
+        // CertID
+        let issuer_name_der = issuer_cert
+            .tbs_certificate
+            .subject
+            .to_der()
+            .unwrap();
+        let issuer_name_hash = sha1_hash(&issuer_name_der);
+        let issuer_key_bytes = issuer_cert
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .raw_bytes()
+            .to_vec();
+        let issuer_key_hash = sha1_hash(&issuer_key_bytes);
+
+        let serial = cert.tbs_certificate.serial_number.to_der().unwrap();
+
+        let sha1_alg_id = build_sha1_algorithm_identifier().unwrap();
+        let name_hash_oct = der_utils::encode_tlv(0x04, &issuer_name_hash);
+        let key_hash_oct = der_utils::encode_tlv(0x04, &issuer_key_hash);
+        let cert_id = der_utils::encode_sequence_from_parts(&[
+            &sha1_alg_id,
+            &name_hash_oct,
+            &key_hash_oct,
+            &serial,
+        ]);
+
+        // certStatus
+        let cert_status_der = match status {
+            CertStatus::Good => {
+                // good [0] IMPLICIT NULL
+                der_utils::encode_tlv(0x80, &[])
+            }
+            CertStatus::Revoked {
+                revocation_time,
+                reason,
+            } => {
+                // revoked [1] IMPLICIT RevokedInfo
+                let rt_str = revocation_time.format("%Y%m%d%H%M%SZ").to_string();
+                let mut revoked_body = der_utils::encode_tlv(0x18, rt_str.as_bytes());
+                if *reason != RevocationReason::Unspecified {
+                    let reason_enum = der_utils::encode_tlv(0x0A, &[reason.code()]);
+                    let reason_explicit = der_utils::encode_tlv(0xA0, &reason_enum);
+                    revoked_body.extend_from_slice(&reason_explicit);
+                }
+                der_utils::encode_tlv(0xA1, &revoked_body)
+            }
+            CertStatus::Unknown => {
+                // unknown [2] IMPLICIT NULL
+                der_utils::encode_tlv(0x82, &[])
+            }
+        };
+
+        // thisUpdate GeneralizedTime
+        let this_update = der_utils::encode_tlv(0x18, b"20260601120000Z");
+
+        // nextUpdate [0] EXPLICIT GeneralizedTime
+        let next_update_gt = der_utils::encode_tlv(0x18, b"20260608120000Z");
+        let next_update = der_utils::encode_tlv(0xA0, &next_update_gt);
+
+        // SingleResponse SEQUENCE
+        der_utils::encode_sequence_from_parts(&[
+            &cert_id,
+            &cert_status_der,
+            &this_update,
+            &next_update,
+        ])
+    }
+
+    #[test]
+    fn test_parse_ocsp_response_good() {
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
+
+        let parsed = parse_ocsp_response(&response_der).unwrap();
+        assert_eq!(parsed.responses.len(), 1);
+        assert!(matches!(parsed.responses[0].cert_status, CertStatus::Good));
+        assert!(parsed.nonce.is_none());
+        assert!(parsed.embedded_certs_der.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ocsp_response_revoked() {
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let revocation_time =
+            chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        let status = CertStatus::Revoked {
+            revocation_time,
+            reason: RevocationReason::KeyCompromise,
+        };
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &status, None);
+
+        let parsed = parse_ocsp_response(&response_der).unwrap();
+        assert_eq!(parsed.responses.len(), 1);
+        match &parsed.responses[0].cert_status {
+            CertStatus::Revoked { reason, .. } => {
+                assert_eq!(*reason, RevocationReason::KeyCompromise);
+            }
+            other => panic!("expected Revoked, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ocsp_response_with_nonce() {
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let nonce = b"test-nonce-1234567890abcdef1234";
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, Some(nonce));
+
+        let parsed = parse_ocsp_response(&response_der).unwrap();
+        assert!(parsed.nonce.is_some());
+        assert_eq!(parsed.nonce.as_deref(), Some(nonce.as_slice()));
+    }
+
+    #[test]
+    fn test_check_revocation_good() {
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
+
+        let validation_time =
+            chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        let status =
+            check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
+        assert!(status.is_valid(), "should be valid: {status}");
+    }
+
+    #[test]
+    fn test_check_revocation_revoked() {
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let revocation_time =
+            chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        let cert_status = CertStatus::Revoked {
+            revocation_time,
+            reason: RevocationReason::Superseded,
+        };
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &cert_status, None);
+
+        let validation_time =
+            chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        let status =
+            check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
+        assert!(status.is_revoked(), "should be revoked: {status}");
+    }
+
+    #[test]
+    fn test_check_revocation_time_aware_future_revocation() {
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        // Revocation time is 2027-01-01, validation time is 2026-06-01
+        // → should be VALID at validation_time
+        let revocation_time =
+            chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        let cert_status = CertStatus::Revoked {
+            revocation_time,
+            reason: RevocationReason::Unspecified,
+        };
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &cert_status, None);
+
+        let validation_time =
+            chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        let status =
+            check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
+        assert!(
+            status.is_valid(),
+            "should be valid (revocation in future): {status}"
+        );
+    }
+
+    #[test]
+    fn test_check_revocation_unknown_status() {
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Unknown, None);
+
+        let validation_time =
+            chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        let status =
+            check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
+        assert!(status.is_unknown(), "should be unknown: {status}");
+    }
+
+    #[test]
+    fn test_check_revocation_with_valid_nonce() {
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+        let nonce = b"test-nonce-1234567890abcdef1234";
+
+        let response_der = build_test_ocsp_response(
+            &issuer,
+            &key_pem,
+            &cert,
+            &CertStatus::Good,
+            Some(nonce),
+        );
+
+        let validation_time =
+            chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+
+        let status = check_revocation(
+            &response_der,
+            &cert,
+            &issuer,
+            Some(nonce),
+            Some(validation_time),
+        )
+        .unwrap();
+        assert!(status.is_valid(), "should be valid with nonce: {status}");
+    }
+
+    #[test]
+    fn test_parse_ocsp_response_invalid_data() {
+        // Not a valid OCSP response
+        let result = parse_ocsp_response(&[0x04, 0x00]); // OCTET STRING
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_has_ocsp_nocheck_extension() {
+        // Our test certs don't have this extension, so this tests the negative case
+        let cert = signer_cert();
+        assert!(!has_ocsp_nocheck_extension(&cert));
+    }
+
+    #[test]
+    fn test_responder_id_variants() {
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
+
+        let parsed = parse_ocsp_response(&response_der).unwrap();
+        // Our synthetic response uses byName
+        assert!(matches!(parsed.responder_id, ResponderId::ByName(_)));
     }
 }

@@ -29,9 +29,14 @@
 pub mod core;
 pub mod cms;
 pub mod crypto;
+pub mod der_utils;
 pub mod error;
 pub mod signer;
 pub mod trust;
+
+// Policy module — always compiled (core types don't need features;
+// the SignatureValidationPolicy trait requires `verify`)
+pub mod policy;
 
 // Feature-gated modules
 #[cfg(feature = "tsp")]

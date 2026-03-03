@@ -12,6 +12,7 @@ use der::{Decode, Encode};
 use spki::AlgorithmIdentifierOwned;
 
 use crate::crypto::algorithm::DigestAlgorithm;
+use crate::der_utils;
 use crate::error::TspError;
 
 // ---------------------------------------------------------------------------
@@ -112,7 +113,7 @@ pub fn build_timestamp_request(
     let mut parts: Vec<Vec<u8>> = Vec::new();
 
     // version INTEGER { v1(1) }
-    parts.push(encode_integer_u64(1));
+    parts.push(der_utils::encode_integer_u64(1));
 
     // messageImprint
     let hash_alg = digest_algorithm_identifier(digest_algorithm);
@@ -125,7 +126,7 @@ pub fn build_timestamp_request(
     let hashed_message_der = hashed_message
         .to_der()
         .map_err(|e| TspError::InvalidResponse(format!("failed to encode hash: {e}")))?;
-    let msg_imprint = encode_sequence(&[&hash_alg_der, &hashed_message_der]);
+    let msg_imprint = der_utils::encode_sequence_from_parts(&[&hash_alg_der, &hashed_message_der]);
     parts.push(msg_imprint);
 
     // reqPolicy OPTIONAL
@@ -138,17 +139,17 @@ pub fn build_timestamp_request(
 
     // nonce OPTIONAL
     if let Some(n) = nonce {
-        parts.push(encode_integer_u64(n));
+        parts.push(der_utils::encode_integer_u64(n));
     }
 
     // certReq BOOLEAN DEFAULT FALSE — only encode when TRUE
     if cert_req {
-        parts.push(encode_boolean(true));
+        parts.push(der_utils::encode_boolean(true));
     }
 
     // Assemble SEQUENCE
     let body: Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
-    Ok(encode_sequence_raw(&body))
+    Ok(der_utils::encode_sequence_raw(&body))
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +180,7 @@ pub struct TimeStampResp {
 /// Parse a DER-encoded RFC 3161 `TimeStampResp`.
 pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspError> {
     // TimeStampResp is a SEQUENCE
-    let (tag, resp_body) = parse_tlv(der_bytes)
+    let (tag, resp_body) = der_utils::parse_tlv(der_bytes)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse TimeStampResp: {e}")))?;
     if tag != 0x30 {
         return Err(TspError::InvalidResponse(format!(
@@ -188,7 +189,7 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
     }
 
     // First element: PKIStatusInfo SEQUENCE
-    let (status_tag, status_body, rest) = parse_tlv_with_rest(&resp_body)
+    let (status_tag, status_body, rest) = der_utils::parse_tlv_with_rest(&resp_body)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse PKIStatusInfo: {e}")))?;
     if status_tag != 0x30 {
         return Err(TspError::InvalidResponse(format!(
@@ -197,14 +198,14 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
     }
 
     // PKIStatusInfo: first element is PKIStatus INTEGER
-    let (int_tag, int_body, status_rest) = parse_tlv_with_rest(&status_body)
+    let (int_tag, int_body, status_rest) = der_utils::parse_tlv_with_rest(&status_body)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse PKIStatus: {e}")))?;
     if int_tag != 0x02 {
         return Err(TspError::InvalidResponse(format!(
             "expected INTEGER tag 0x02 for PKIStatus, got 0x{int_tag:02x}"
         )));
     }
-    let status_val = decode_integer_u64(&int_body);
+    let status_val = der_utils::decode_integer_u64(&int_body);
     let status = PkiStatus::from_u64(status_val);
 
     // Parse optional statusString and failureInfo from status_rest
@@ -213,12 +214,13 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
     let mut remaining = status_rest;
 
     while !remaining.is_empty() {
-        if let Ok((stag, sbody, srest)) = parse_tlv_with_rest(remaining) {
+        if let Ok((stag, sbody, srest)) = der_utils::parse_tlv_with_rest(remaining) {
             match stag {
                 // SEQUENCE OF UTF8String (statusString)
                 0x30 => {
                     // Try to extract the first UTF8String
-                    if let Ok((_inner_tag, inner_body, _)) = parse_tlv_with_rest(&sbody) {
+                    if let Ok((_inner_tag, inner_body, _)) = der_utils::parse_tlv_with_rest(&sbody)
+                    {
                         status_string = Some(String::from_utf8_lossy(&inner_body).to_string());
                     }
                 }
@@ -237,7 +239,7 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
     // Second element: TimeStampToken OPTIONAL
     let token_der = if !rest.is_empty() {
         // The token is a ContentInfo (SEQUENCE)
-        let (token_tag, _, _) = parse_tlv_with_rest(rest)
+        let (token_tag, _, _) = der_utils::parse_tlv_with_rest(rest)
             .map_err(|e| TspError::InvalidResponse(format!("failed to parse token TLV: {e}")))?;
         if token_tag == 0x30 {
             // Re-encode the entire TLV (tag + length + value) as the token DER
@@ -344,7 +346,7 @@ pub struct TstInfo {
 /// whose encapsulated content is id-ct-TSTInfo.
 pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     // Parse ContentInfo SEQUENCE
-    let (tag, ci_body) = parse_tlv(token_der)
+    let (tag, ci_body) = der_utils::parse_tlv(token_der)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse ContentInfo: {e}")))?;
     if tag != 0x30 {
         return Err(TspError::InvalidResponse(
@@ -353,11 +355,11 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     }
 
     // contentType OID — should be id-signedData
-    let (_oid_tag, _oid_body, ci_rest) = parse_tlv_with_rest(&ci_body)
+    let (_oid_tag, _oid_body, ci_rest) = der_utils::parse_tlv_with_rest(&ci_body)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse contentType: {e}")))?;
 
     // content [0] EXPLICIT — the SignedData
-    let (ctx_tag, sd_inner, _) = parse_tlv_with_rest(ci_rest)
+    let (ctx_tag, sd_inner, _) = der_utils::parse_tlv_with_rest(ci_rest)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse content [0]: {e}")))?;
     if ctx_tag != 0xA0 {
         return Err(TspError::InvalidResponse(format!(
@@ -366,7 +368,7 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     }
 
     // SignedData SEQUENCE
-    let (sd_tag, sd_body) = parse_tlv(&sd_inner)
+    let (sd_tag, sd_body) = der_utils::parse_tlv(&sd_inner)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse SignedData: {e}")))?;
     if sd_tag != 0x30 {
         return Err(TspError::InvalidResponse(
@@ -375,23 +377,23 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     }
 
     // SignedData fields: version, digestAlgorithms, encapContentInfo, [0] certs, [1] crls, signerInfos
-    let (_ver_tag, _ver_body, sd_rest) = parse_tlv_with_rest(&sd_body)
+    let (_ver_tag, _ver_body, sd_rest) = der_utils::parse_tlv_with_rest(&sd_body)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse SD version: {e}")))?;
 
     // digestAlgorithms SET OF
-    let (_da_tag, _da_body, sd_rest2) = parse_tlv_with_rest(sd_rest)
+    let (_da_tag, _da_body, sd_rest2) = der_utils::parse_tlv_with_rest(sd_rest)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse digestAlgorithms: {e}")))?;
 
     // encapContentInfo SEQUENCE
-    let (_eci_tag, eci_body, _sd_rest3) = parse_tlv_with_rest(sd_rest2)
+    let (_eci_tag, eci_body, _sd_rest3) = der_utils::parse_tlv_with_rest(sd_rest2)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse encapContentInfo: {e}")))?;
 
     // eContentType OID
-    let (_ect_tag, _ect_body, eci_rest) = parse_tlv_with_rest(&eci_body)
+    let (_ect_tag, _ect_body, eci_rest) = der_utils::parse_tlv_with_rest(&eci_body)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse eContentType: {e}")))?;
 
     // eContent [0] EXPLICIT
-    let (ec_tag, ec_inner, _) = parse_tlv_with_rest(eci_rest)
+    let (ec_tag, ec_inner, _) = der_utils::parse_tlv_with_rest(eci_rest)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse eContent [0]: {e}")))?;
     if ec_tag != 0xA0 {
         return Err(TspError::InvalidResponse(format!(
@@ -400,7 +402,7 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     }
 
     // The eContent is an OCTET STRING containing TSTInfo
-    let (os_tag, tst_info_der, _) = parse_tlv_with_rest(&ec_inner).map_err(|e| {
+    let (os_tag, tst_info_der, _) = der_utils::parse_tlv_with_rest(&ec_inner).map_err(|e| {
         TspError::InvalidResponse(format!("failed to parse eContent OCTET STRING: {e}"))
     })?;
     if os_tag != 0x04 {
@@ -430,7 +432,7 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
 /// }
 /// ```
 fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
-    let (tag, body) = parse_tlv(der_bytes).map_err(|e| {
+    let (tag, body) = der_utils::parse_tlv(der_bytes).map_err(|e| {
         TspError::InvalidResponse(format!("TSTInfo: failed to parse SEQUENCE: {e}"))
     })?;
     if tag != 0x30 {
@@ -442,20 +444,20 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
     let mut pos = &body[..];
 
     // version INTEGER
-    let (_vtag, _vbody, rest) = parse_tlv_with_rest(pos)
+    let (_vtag, _vbody, rest) = der_utils::parse_tlv_with_rest(pos)
         .map_err(|e| TspError::InvalidResponse(format!("TSTInfo: failed to parse version: {e}")))?;
     pos = rest;
 
     // policy TSAPolicyId (OID)
-    let (_ptag, pbody, rest) = parse_tlv_with_rest(pos)
+    let (_ptag, pbody, rest) = der_utils::parse_tlv_with_rest(pos)
         .map_err(|e| TspError::InvalidResponse(format!("TSTInfo: failed to parse policy: {e}")))?;
-    let policy_oid = ObjectIdentifier::from_der(&encode_tlv(0x06, &pbody))
+    let policy_oid = ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, &pbody))
         .ok()
         .map(|oid| oid.to_string());
     pos = rest;
 
     // messageImprint SEQUENCE { hashAlgorithm, hashedMessage }
-    let (_mi_tag, mi_body, rest) = parse_tlv_with_rest(pos).map_err(|e| {
+    let (_mi_tag, mi_body, rest) = der_utils::parse_tlv_with_rest(pos).map_err(|e| {
         TspError::InvalidResponse(format!("TSTInfo: failed to parse messageImprint: {e}"))
     })?;
     pos = rest;
@@ -463,14 +465,14 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
     let (hash_algorithm, message_hash) = parse_message_imprint(&mi_body)?;
 
     // serialNumber INTEGER
-    let (_sn_tag, sn_body, rest) = parse_tlv_with_rest(pos).map_err(|e| {
+    let (_sn_tag, sn_body, rest) = der_utils::parse_tlv_with_rest(pos).map_err(|e| {
         TspError::InvalidResponse(format!("TSTInfo: failed to parse serialNumber: {e}"))
     })?;
     let serial_number = sn_body.to_vec();
     pos = rest;
 
     // genTime GeneralizedTime
-    let (_gt_tag, gt_body, rest) = parse_tlv_with_rest(pos)
+    let (_gt_tag, gt_body, rest) = der_utils::parse_tlv_with_rest(pos)
         .map_err(|e| TspError::InvalidResponse(format!("TSTInfo: failed to parse genTime: {e}")))?;
     let gen_time_der = gt_body.to_vec();
     pos = rest;
@@ -479,7 +481,7 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
     let mut nonce = None;
 
     while !pos.is_empty() {
-        if let Ok((ftag, fbody, frest)) = parse_tlv_with_rest(pos) {
+        if let Ok((ftag, fbody, frest)) = der_utils::parse_tlv_with_rest(pos) {
             match ftag {
                 // accuracy is SEQUENCE
                 0x30 => {
@@ -491,7 +493,7 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
                 }
                 // nonce INTEGER
                 0x02 => {
-                    nonce = Some(decode_integer_u64(&fbody));
+                    nonce = Some(der_utils::decode_integer_u64(&fbody));
                 }
                 // tsa [0] GeneralName
                 0xA0 => {
@@ -524,27 +526,28 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
 /// Parse a MessageImprint: { hashAlgorithm AlgorithmIdentifier, hashedMessage OCTET STRING }
 fn parse_message_imprint(body: &[u8]) -> Result<(DigestAlgorithm, Vec<u8>), TspError> {
     // hashAlgorithm SEQUENCE
-    let (_alg_tag, alg_body, rest) = parse_tlv_with_rest(body).map_err(|e| {
+    let (_alg_tag, alg_body, rest) = der_utils::parse_tlv_with_rest(body).map_err(|e| {
         TspError::InvalidResponse(format!(
             "messageImprint: failed to parse hashAlgorithm: {e}"
         ))
     })?;
 
     // First element of AlgorithmIdentifier is the OID
-    let (_oid_tag, oid_body, _) = parse_tlv_with_rest(&alg_body).map_err(|e| {
+    let (_oid_tag, oid_body, _) = der_utils::parse_tlv_with_rest(&alg_body).map_err(|e| {
         TspError::InvalidResponse(format!(
             "messageImprint: failed to parse algorithm OID: {e}"
         ))
     })?;
 
-    let alg_oid = ObjectIdentifier::from_der(&encode_tlv(0x06, &oid_body)).map_err(|e| {
-        TspError::InvalidResponse(format!("messageImprint: invalid algorithm OID: {e}"))
-    })?;
+    let alg_oid =
+        ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, &oid_body)).map_err(|e| {
+            TspError::InvalidResponse(format!("messageImprint: invalid algorithm OID: {e}"))
+        })?;
 
     let digest_alg = oid_to_digest_algorithm(&alg_oid)?;
 
     // hashedMessage OCTET STRING
-    let (_hash_tag, hash_body, _) = parse_tlv_with_rest(rest).map_err(|e| {
+    let (_hash_tag, hash_body, _) = der_utils::parse_tlv_with_rest(rest).map_err(|e| {
         TspError::InvalidResponse(format!(
             "messageImprint: failed to parse hashedMessage: {e}"
         ))
@@ -594,154 +597,6 @@ pub fn generate_nonce() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level DER helpers (self-contained for this module)
-// ---------------------------------------------------------------------------
-
-/// Parse a DER TLV and return (tag, value_bytes).
-fn parse_tlv(data: &[u8]) -> Result<(u8, Vec<u8>), String> {
-    let (tag, body, rest) = parse_tlv_with_rest(data)?;
-    if !rest.is_empty() {
-        // There's trailing data, but for the outer call this is fine —
-        // we just want the first TLV
-    }
-    Ok((tag, body.to_vec()))
-}
-
-/// Parse a DER TLV and return (tag, value_bytes_slice, remaining_bytes).
-fn parse_tlv_with_rest(data: &[u8]) -> Result<(u8, &[u8], &[u8]), String> {
-    if data.is_empty() {
-        return Err("empty input".into());
-    }
-
-    let tag = data[0];
-    let (len, header_len) = parse_der_length(&data[1..])?;
-    let total_header = 1 + header_len;
-
-    if total_header + len > data.len() {
-        return Err(format!(
-            "TLV length exceeds data: header={total_header}, len={len}, available={}",
-            data.len()
-        ));
-    }
-
-    let value = &data[total_header..total_header + len];
-    let rest = &data[total_header + len..];
-    Ok((tag, value, rest))
-}
-
-/// Parse DER definite-form length. Returns (length_value, number_of_bytes_consumed).
-fn parse_der_length(data: &[u8]) -> Result<(usize, usize), String> {
-    if data.is_empty() {
-        return Err("empty length".into());
-    }
-
-    let first = data[0];
-    if first < 0x80 {
-        Ok((first as usize, 1))
-    } else if first == 0x80 {
-        Err("indefinite length not supported".into())
-    } else {
-        let num_bytes = (first & 0x7F) as usize;
-        if num_bytes > 4 {
-            return Err(format!("length too large: {num_bytes} bytes"));
-        }
-        if 1 + num_bytes > data.len() {
-            return Err("insufficient data for length".into());
-        }
-        let mut len: usize = 0;
-        for i in 0..num_bytes {
-            len = (len << 8) | (data[1 + i] as usize);
-        }
-        Ok((len, 1 + num_bytes))
-    }
-}
-
-/// Encode a DER TLV from tag and value bytes.
-fn encode_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 5 + value.len());
-    out.push(tag);
-    encode_der_length(&mut out, value.len());
-    out.extend_from_slice(value);
-    out
-}
-
-/// Encode a DER SEQUENCE wrapping the concatenation of parts.
-fn encode_sequence(parts: &[&[u8]]) -> Vec<u8> {
-    let total_len: usize = parts.iter().map(|p| p.len()).sum();
-    let mut body = Vec::with_capacity(total_len);
-    for part in parts {
-        body.extend_from_slice(part);
-    }
-    encode_sequence_raw(&body)
-}
-
-/// Encode a DER SEQUENCE from a pre-assembled body.
-fn encode_sequence_raw(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 5 + body.len());
-    out.push(0x30); // SEQUENCE tag
-    encode_der_length(&mut out, body.len());
-    out.extend_from_slice(body);
-    out
-}
-
-/// Encode DER definite-form length.
-fn encode_der_length(out: &mut Vec<u8>, len: usize) {
-    if len < 0x80 {
-        out.push(len as u8);
-    } else if len <= 0xFF {
-        out.push(0x81);
-        out.push(len as u8);
-    } else if len <= 0xFFFF {
-        out.push(0x82);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-    } else if len <= 0xFF_FFFF {
-        out.push(0x83);
-        out.push((len >> 16) as u8);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-    } else {
-        out.push(0x84);
-        out.push((len >> 24) as u8);
-        out.push((len >> 16) as u8);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-    }
-}
-
-/// Encode a non-negative integer as DER INTEGER.
-fn encode_integer_u64(val: u64) -> Vec<u8> {
-    // Encode the value as big-endian bytes, strip leading zeros,
-    // then prepend 0x00 if the high bit is set (to keep it positive).
-    let be_bytes = val.to_be_bytes();
-    let start = be_bytes.iter().position(|&b| b != 0).unwrap_or(7);
-    let significant = &be_bytes[start..];
-
-    let needs_padding = significant.is_empty() || (significant[0] & 0x80) != 0;
-    let mut value_bytes = Vec::with_capacity(significant.len() + 1);
-    if needs_padding {
-        value_bytes.push(0x00);
-    }
-    value_bytes.extend_from_slice(significant);
-
-    encode_tlv(0x02, &value_bytes)
-}
-
-/// Decode a DER INTEGER to u64 (for nonce comparison).
-fn decode_integer_u64(bytes: &[u8]) -> u64 {
-    let mut val: u64 = 0;
-    for &b in bytes {
-        val = (val << 8) | (b as u64);
-    }
-    val
-}
-
-/// Encode a BOOLEAN value.
-fn encode_boolean(val: bool) -> Vec<u8> {
-    encode_tlv(0x01, &[if val { 0xFF } else { 0x00 }])
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -759,7 +614,7 @@ mod tests {
         assert_eq!(req[0], 0x30, "should start with SEQUENCE tag");
 
         // Parse it back
-        let (tag, _body) = parse_tlv(&req).unwrap();
+        let (tag, _body) = der_utils::parse_tlv(&req).unwrap();
         assert_eq!(tag, 0x30);
     }
 
@@ -770,22 +625,22 @@ mod tests {
         let req = build_timestamp_request(DigestAlgorithm::Sha256, &hash, None, Some(nonce), true)
             .unwrap();
 
-        let (tag, _body) = parse_tlv(&req).unwrap();
+        let (tag, _body) = der_utils::parse_tlv(&req).unwrap();
         assert_eq!(tag, 0x30);
     }
 
     #[test]
     fn test_encode_integer_u64() {
         // Encode 1
-        let encoded = encode_integer_u64(1);
+        let encoded = der_utils::encode_integer_u64(1);
         assert_eq!(encoded, vec![0x02, 0x01, 0x01]);
 
         // Encode 128 (needs padding because high bit set)
-        let encoded = encode_integer_u64(128);
+        let encoded = der_utils::encode_integer_u64(128);
         assert_eq!(encoded, vec![0x02, 0x02, 0x00, 0x80]);
 
         // Encode 0
-        let encoded = encode_integer_u64(0);
+        let encoded = der_utils::encode_integer_u64(0);
         // Should be 0x02 0x01 0x00
         assert_eq!(encoded, vec![0x02, 0x01, 0x00]);
     }
@@ -803,8 +658,8 @@ mod tests {
     fn test_der_length_roundtrip() {
         for len in [0, 1, 127, 128, 255, 256, 65535, 65536] {
             let mut buf = Vec::new();
-            encode_der_length(&mut buf, len);
-            let (parsed_len, consumed) = parse_der_length(&buf).unwrap();
+            der_utils::encode_der_length(&mut buf, len);
+            let (parsed_len, consumed) = der_utils::parse_der_length(&buf).unwrap();
             assert_eq!(parsed_len, len, "length roundtrip failed for {len}");
             assert_eq!(consumed, buf.len());
         }
@@ -814,8 +669,8 @@ mod tests {
     fn test_parse_timestamp_response_error_status() {
         // Build a minimal TimeStampResp with rejection status
         // PKIStatusInfo SEQUENCE { PKIStatus INTEGER 2 }
-        let status_info = encode_sequence_raw(&encode_integer_u64(2));
-        let resp_der = encode_sequence_raw(&status_info);
+        let status_info = der_utils::encode_sequence_raw(&der_utils::encode_integer_u64(2));
+        let resp_der = der_utils::encode_sequence_raw(&status_info);
 
         let resp = parse_timestamp_response(&resp_der).unwrap();
         assert_eq!(resp.status, PkiStatus::Rejection);

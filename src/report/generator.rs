@@ -351,10 +351,13 @@ mod tests {
             certificate_validity: CertValidity::Valid,
             chain_trusted: true,
             trust_anchor: Some("Root CA".to_string()),
+            revocation_status: None,
+            per_cert_revocation: Vec::new(),
             pades_level: DetectedPadesLevel::BB,
             modifications_after_signing: false,
             covers_whole_document_revision: None,
             extended_by_non_safe_updates: None,
+            policy_result: None,
             summary: "Signature is valid".to_string(),
         }
     }
@@ -375,10 +378,13 @@ mod tests {
             certificate_validity: CertValidity::Expired,
             chain_trusted: false,
             trust_anchor: None,
+            revocation_status: None,
+            per_cert_revocation: Vec::new(),
             pades_level: DetectedPadesLevel::NotPades,
             modifications_after_signing: false,
             covers_whole_document_revision: None,
             extended_by_non_safe_updates: None,
+            policy_result: None,
             summary: "Signature is invalid".to_string(),
         }
     }
@@ -390,6 +396,9 @@ mod tests {
             document_modified: false,
             valid_count: 1,
             invalid_count: 0,
+            policy_passed_count: 0,
+            policy_failed_count: 0,
+            policy_indeterminate_count: 0,
             summary: "All signatures valid".to_string(),
         };
 
@@ -411,6 +420,9 @@ mod tests {
             document_modified: false,
             valid_count: 0,
             invalid_count: 1,
+            policy_passed_count: 0,
+            policy_failed_count: 0,
+            policy_indeterminate_count: 0,
             summary: "Validation failed".to_string(),
         };
 
@@ -433,6 +445,9 @@ mod tests {
             document_modified: false,
             valid_count: 1,
             invalid_count: 1,
+            policy_passed_count: 0,
+            policy_failed_count: 0,
+            policy_indeterminate_count: 0,
             summary: "Mixed results".to_string(),
         };
 
@@ -457,6 +472,9 @@ mod tests {
             document_modified: false,
             valid_count: 1,
             invalid_count: 0,
+            policy_passed_count: 0,
+            policy_failed_count: 0,
+            policy_indeterminate_count: 0,
             summary: "OK".to_string(),
         };
 
@@ -478,6 +496,9 @@ mod tests {
             document_modified: false,
             valid_count: 1,
             invalid_count: 0,
+            policy_passed_count: 0,
+            policy_failed_count: 0,
+            policy_indeterminate_count: 0,
             summary: "OK".to_string(),
         };
 
@@ -506,10 +527,13 @@ mod tests {
             certificate_validity: CertValidity::ChainIncomplete,
             chain_trusted: false,
             trust_anchor: None,
+            revocation_status: None,
+            per_cert_revocation: Vec::new(),
             pades_level: DetectedPadesLevel::Unknown,
             modifications_after_signing: false,
             covers_whole_document_revision: None,
             extended_by_non_safe_updates: None,
+            policy_result: None,
             summary: "Could not determine".to_string(),
         };
 
@@ -518,6 +542,9 @@ mod tests {
             document_modified: false,
             valid_count: 0,
             invalid_count: 1,
+            policy_passed_count: 0,
+            policy_failed_count: 0,
+            policy_indeterminate_count: 0,
             summary: "Indeterminate".to_string(),
         };
 
@@ -535,6 +562,9 @@ mod tests {
             document_modified: false,
             valid_count: 0,
             invalid_count: 0,
+            policy_passed_count: 0,
+            policy_failed_count: 0,
+            policy_indeterminate_count: 0,
             summary: "No signatures found".to_string(),
         };
 
@@ -553,6 +583,9 @@ mod tests {
             document_modified: false,
             valid_count: 1,
             invalid_count: 0,
+            policy_passed_count: 0,
+            policy_failed_count: 0,
+            policy_indeterminate_count: 0,
             summary: "OK".to_string(),
         };
 
@@ -609,6 +642,9 @@ mod tests {
             document_modified: false,
             valid_count: 1,
             invalid_count: 0,
+            policy_passed_count: 0,
+            policy_failed_count: 0,
+            policy_indeterminate_count: 0,
             summary: "OK".to_string(),
         };
 

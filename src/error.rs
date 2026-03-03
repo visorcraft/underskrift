@@ -162,6 +162,12 @@ pub enum LtvError {
 
     #[error("DSS construction error: {0}")]
     Dss(String),
+
+    #[error("revocation check error: {0}")]
+    Revocation(String),
+
+    #[error("X.509 extension validation error: {0}")]
+    X509Extension(String),
 }
 
 /// Errors from the `verify` module — signature verification.
@@ -182,6 +188,9 @@ pub enum VerifyError {
 
     #[error("signature is expired or not yet valid")]
     TimeValidity,
+
+    #[error("certificate has been revoked: {0}")]
+    Revoked(String),
 }
 
 /// Errors from the `trust` module — trust store management.

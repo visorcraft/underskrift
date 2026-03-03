@@ -1,7 +1,9 @@
-//! CRL fetching and caching.
+//! CRL fetching, caching, and revocation checking.
 //!
 //! Fetches Certificate Revocation Lists from distribution points found in
 //! X.509 certificates, with both in-memory and optional disk caching.
+//! Also provides CRL content parsing and signature verification for
+//! offline revocation status checking.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -10,7 +12,12 @@ use std::time::{Duration, Instant};
 use reqwest::Client;
 use x509_cert::Certificate;
 
+use crate::der_utils::{
+    find_tagged_value, integer_bodies_equal, parse_integer_body, parse_tlv,
+    parse_tlv_with_rest, parse_x509_time,
+};
 use crate::error::LtvError;
+use crate::ltv::status::{RevocationReason, RevocationSource, ValidationStatus};
 
 /// A cached CRL entry.
 #[derive(Debug, Clone)]
@@ -260,59 +267,421 @@ fn parse_crl_dp_extension(der_bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(urls)
 }
 
-// ---------------------------------------------------------------------------
-// DER parsing helpers (duplicated from tsp::token for module independence)
-// ---------------------------------------------------------------------------
+// ── CRL content parsing and revocation checking ─────────────────────────────
 
-fn parse_tlv(data: &[u8]) -> Result<(u8, Vec<u8>), String> {
-    let (tag, body, _rest) = parse_tlv_with_rest(data)?;
-    Ok((tag, body.to_vec()))
+/// A parsed revoked certificate entry from a CRL.
+#[derive(Debug, Clone)]
+pub struct RevokedEntry {
+    /// Serial number of the revoked certificate (leading-zero-stripped).
+    pub serial_number: Vec<u8>,
+    /// When the certificate was revoked.
+    pub revocation_time: chrono::DateTime<chrono::Utc>,
+    /// Reason for revocation, if present in CRL entry extensions.
+    pub reason: RevocationReason,
 }
 
-fn parse_tlv_with_rest(data: &[u8]) -> Result<(u8, &[u8], &[u8]), String> {
-    if data.is_empty() {
-        return Err("empty input".into());
+/// Parsed contents of a CRL's TBSCertList.
+#[derive(Debug)]
+pub struct ParsedCrl {
+    /// Raw TBS bytes (for signature verification).
+    pub tbs_bytes: Vec<u8>,
+    /// Signature algorithm OID.
+    pub signature_algorithm_oid: const_oid::ObjectIdentifier,
+    /// Raw signature bytes (BIT STRING contents, without the unused-bits byte).
+    pub signature_bytes: Vec<u8>,
+    /// CRL issuer distinguished name (raw DER of the Name SEQUENCE).
+    pub issuer_der: Vec<u8>,
+    /// thisUpdate timestamp.
+    pub this_update: chrono::DateTime<chrono::Utc>,
+    /// nextUpdate timestamp, if present.
+    pub next_update: Option<chrono::DateTime<chrono::Utc>>,
+    /// Revoked certificate entries.
+    pub revoked_entries: Vec<RevokedEntry>,
+}
+
+/// Parse a DER-encoded CRL into its structural components.
+///
+/// ```text
+/// CertificateList ::= SEQUENCE {
+///     tbsCertList          TBSCertList,
+///     signatureAlgorithm   AlgorithmIdentifier,
+///     signatureValue       BIT STRING
+/// }
+///
+/// TBSCertList ::= SEQUENCE {
+///     version              Version OPTIONAL (v2 = INTEGER 1),
+///     signature            AlgorithmIdentifier,
+///     issuer               Name,
+///     thisUpdate           Time,
+///     nextUpdate           Time OPTIONAL,
+///     revokedCertificates  SEQUENCE OF SEQUENCE { ... } OPTIONAL,
+///     crlExtensions    [0] Extensions OPTIONAL
+/// }
+/// ```
+pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
+    // Outer SEQUENCE: CertificateList
+    let (outer_tag, outer_body) =
+        parse_tlv(crl_der).map_err(|e| LtvError::Crl(format!("CRL outer SEQUENCE: {e}")))?;
+    if outer_tag != 0x30 {
+        return Err(LtvError::Crl(format!(
+            "expected CRL SEQUENCE (0x30), got 0x{outer_tag:02x}"
+        )));
     }
-    let tag = data[0];
-    let (len, header_len) = parse_der_length(&data[1..])?;
-    let total_header = 1 + header_len;
-    if total_header + len > data.len() {
-        return Err(format!(
-            "TLV length exceeds data: header={total_header}, len={len}, available={}",
-            data.len()
+
+    // Parse the three children: tbsCertList, signatureAlgorithm, signatureValue
+    let (tbs_tag, tbs_value, rest) = parse_tlv_with_rest(&outer_body)
+        .map_err(|e| LtvError::Crl(format!("CRL tbsCertList: {e}")))?;
+    if tbs_tag != 0x30 {
+        return Err(LtvError::Crl(format!(
+            "expected tbsCertList SEQUENCE, got 0x{tbs_tag:02x}"
+        )));
+    }
+    // Reconstruct full TBS DER (tag + length + value) for signature verification
+    let tbs_start = crl_der.len() - outer_body.len();
+    let tbs_end = crl_der.len() - outer_body.len() + (outer_body.len() - rest.len());
+    let tbs_bytes = crl_der[tbs_start..tbs_end].to_vec();
+
+    // signatureAlgorithm SEQUENCE
+    let (sig_alg_tag, sig_alg_body, rest) =
+        parse_tlv_with_rest(rest).map_err(|e| LtvError::Crl(format!("CRL sigAlg: {e}")))?;
+    if sig_alg_tag != 0x30 {
+        return Err(LtvError::Crl(format!(
+            "expected signatureAlgorithm SEQUENCE, got 0x{sig_alg_tag:02x}"
+        )));
+    }
+    // Extract OID from the AlgorithmIdentifier SEQUENCE
+    let sig_oid = parse_oid_from_algorithm_identifier(&sig_alg_body)?;
+
+    // signatureValue BIT STRING
+    let (sig_val_tag, sig_val_body, _) =
+        parse_tlv_with_rest(rest).map_err(|e| LtvError::Crl(format!("CRL sigValue: {e}")))?;
+    if sig_val_tag != 0x03 {
+        return Err(LtvError::Crl(format!(
+            "expected signatureValue BIT STRING (0x03), got 0x{sig_val_tag:02x}"
+        )));
+    }
+    // BIT STRING: first byte is unused-bits count (should be 0)
+    if sig_val_body.is_empty() {
+        return Err(LtvError::Crl("empty signature BIT STRING".into()));
+    }
+    let signature_bytes = sig_val_body[1..].to_vec();
+
+    // Parse TBSCertList body
+    let mut tbs_pos = &tbs_value[..];
+
+    // Optional: version [0] EXPLICIT INTEGER (v2 = 1)
+    if !tbs_pos.is_empty() && tbs_pos[0] == 0x02 {
+        // Check if first field is an INTEGER — could be version if small,
+        // or could be the AlgorithmIdentifier. Actually version is optional
+        // and v1 CRLs might omit it. The next field after optional version
+        // is a SEQUENCE (AlgorithmIdentifier). Let's peek:
+        // If we see INTEGER, skip it as version.
+        let (_, _, r) = parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Crl(format!("CRL version: {e}")))?;
+        tbs_pos = r;
+    }
+
+    // signature AlgorithmIdentifier (SEQUENCE) — skip, we got it from outer
+    if !tbs_pos.is_empty() {
+        let (tag, _, r) = parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Crl(format!("CRL inner sigAlg: {e}")))?;
+        if tag == 0x30 {
+            tbs_pos = r;
+        }
+    }
+
+    // issuer Name (SEQUENCE)
+    let (issuer_tag, _issuer_body, rest_after_issuer) = parse_tlv_with_rest(tbs_pos)
+        .map_err(|e| LtvError::Crl(format!("CRL issuer: {e}")))?;
+    if issuer_tag != 0x30 {
+        return Err(LtvError::Crl(format!(
+            "expected issuer SEQUENCE, got 0x{issuer_tag:02x}"
+        )));
+    }
+    // Capture raw issuer DER (full TLV)
+    let issuer_len = tbs_pos.len() - rest_after_issuer.len();
+    let issuer_der = tbs_pos[..issuer_len].to_vec();
+    tbs_pos = rest_after_issuer;
+
+    // thisUpdate Time (UTCTime 0x17 or GeneralizedTime 0x18)
+    let (time_tag, time_body, rest_after_this) = parse_tlv_with_rest(tbs_pos)
+        .map_err(|e| LtvError::Crl(format!("CRL thisUpdate: {e}")))?;
+    let this_update = parse_x509_time(time_tag, time_body)
+        .map_err(|e| LtvError::Crl(format!("CRL thisUpdate parse: {e}")))?;
+    tbs_pos = rest_after_this;
+
+    // nextUpdate Time OPTIONAL
+    let mut next_update = None;
+    if !tbs_pos.is_empty() && (tbs_pos[0] == 0x17 || tbs_pos[0] == 0x18) {
+        let (nt_tag, nt_body, r) = parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Crl(format!("CRL nextUpdate: {e}")))?;
+        next_update = Some(
+            parse_x509_time(nt_tag, nt_body)
+                .map_err(|e| LtvError::Crl(format!("CRL nextUpdate parse: {e}")))?,
+        );
+        tbs_pos = r;
+    }
+
+    // revokedCertificates SEQUENCE OF OPTIONAL
+    let mut revoked_entries = Vec::new();
+    if !tbs_pos.is_empty() && tbs_pos[0] == 0x30 {
+        let (rc_tag, rc_body, r) = parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Crl(format!("CRL revokedCertificates: {e}")))?;
+        if rc_tag == 0x30 {
+            parse_revoked_certificates(rc_body, &mut revoked_entries)?;
+        }
+        tbs_pos = r;
+    }
+    // Remaining: optional [0] crlExtensions — we skip for now
+    let _ = tbs_pos;
+
+    Ok(ParsedCrl {
+        tbs_bytes,
+        signature_algorithm_oid: sig_oid,
+        signature_bytes,
+        issuer_der,
+        this_update,
+        next_update,
+        revoked_entries,
+    })
+}
+
+/// Parse an OID from a DER AlgorithmIdentifier body.
+fn parse_oid_from_algorithm_identifier(body: &[u8]) -> Result<const_oid::ObjectIdentifier, LtvError>
+{
+    let (tag, oid_bytes, _) =
+        parse_tlv_with_rest(body).map_err(|e| LtvError::Crl(format!("AlgId OID: {e}")))?;
+    if tag != 0x06 {
+        return Err(LtvError::Crl(format!(
+            "expected OID (0x06) in AlgorithmIdentifier, got 0x{tag:02x}"
+        )));
+    }
+    const_oid::ObjectIdentifier::from_bytes(oid_bytes)
+        .map_err(|e| LtvError::Crl(format!("invalid OID: {e}")))
+}
+
+/// Parse the revokedCertificates SEQUENCE body.
+///
+/// ```text
+/// revokedCertificates ::= SEQUENCE OF SEQUENCE {
+///     userCertificate    CertificateSerialNumber (INTEGER),
+///     revocationDate     Time,
+///     crlEntryExtensions Extensions OPTIONAL
+/// }
+/// ```
+fn parse_revoked_certificates(
+    body: &[u8],
+    entries: &mut Vec<RevokedEntry>,
+) -> Result<(), LtvError> {
+    let mut pos = body;
+    while !pos.is_empty() {
+        let (entry_tag, entry_body, rest) = parse_tlv_with_rest(pos)
+            .map_err(|e| LtvError::Crl(format!("revoked entry: {e}")))?;
+        if entry_tag != 0x30 {
+            return Err(LtvError::Crl(format!(
+                "expected revoked entry SEQUENCE, got 0x{entry_tag:02x}"
+            )));
+        }
+
+        // userCertificate INTEGER
+        let (serial_tag, serial_body, entry_rest) = parse_tlv_with_rest(entry_body)
+            .map_err(|e| LtvError::Crl(format!("revoked serial: {e}")))?;
+        if serial_tag != 0x02 {
+            return Err(LtvError::Crl(format!(
+                "expected serial INTEGER (0x02), got 0x{serial_tag:02x}"
+            )));
+        }
+        let serial_number = parse_integer_body(serial_body);
+
+        // revocationDate Time
+        let (time_tag, time_body, entry_rest2) = parse_tlv_with_rest(entry_rest)
+            .map_err(|e| LtvError::Crl(format!("revocation date: {e}")))?;
+        let revocation_time = parse_x509_time(time_tag, time_body)
+            .map_err(|e| LtvError::Crl(format!("revocation date parse: {e}")))?;
+
+        // crlEntryExtensions OPTIONAL — look for reason code
+        let reason = parse_revocation_reason(entry_rest2);
+
+        entries.push(RevokedEntry {
+            serial_number,
+            revocation_time,
+            reason,
+        });
+
+        pos = rest;
+    }
+    Ok(())
+}
+
+/// Parse optional CRL entry extensions to find a reason code.
+///
+/// The reason code extension (OID 2.5.29.21) contains an ENUMERATED value.
+fn parse_revocation_reason(extensions_area: &[u8]) -> RevocationReason {
+    if extensions_area.is_empty() {
+        return RevocationReason::Unspecified;
+    }
+
+    // Extensions is a SEQUENCE OF Extension
+    let Ok((tag, ext_body, _)) = parse_tlv_with_rest(extensions_area) else {
+        return RevocationReason::Unspecified;
+    };
+    if tag != 0x30 {
+        return RevocationReason::Unspecified;
+    }
+
+    // CRL reason code OID: 2.5.29.21
+    let reason_oid_bytes: &[u8] = &[0x55, 0x1D, 0x15]; // 2.5.29.21
+
+    // Walk through extensions
+    let mut pos = &ext_body[..];
+    while !pos.is_empty() {
+        let Ok((ext_tag, ext_value, rest)) = parse_tlv_with_rest(pos) else {
+            break;
+        };
+        if ext_tag == 0x30 {
+            // Extension SEQUENCE: OID + optional critical BOOLEAN + value OCTET STRING
+            if let Some(oid_body) = find_tagged_value(ext_value, 0x06) {
+                if oid_body == reason_oid_bytes {
+                    // Found reason code extension — value is in OCTET STRING
+                    if let Some(octet_body) = find_tagged_value(ext_value, 0x04) {
+                        // Inside the OCTET STRING is an ENUMERATED value
+                        if let Some(enum_body) = find_tagged_value(octet_body, 0x0A) {
+                            if !enum_body.is_empty() {
+                                return RevocationReason::from_code(enum_body[0]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pos = rest;
+    }
+
+    RevocationReason::Unspecified
+}
+
+/// Verify a CRL's signature against the issuer's public key.
+///
+/// Extracts the issuer's SPKI, then delegates to [`crate::crypto::verify::verify_signature_by_oid`].
+pub fn verify_crl_signature(
+    parsed_crl: &ParsedCrl,
+    issuer: &Certificate,
+) -> Result<(), LtvError> {
+    use der::Encode;
+
+    let spki_der = issuer
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|e| LtvError::Crl(format!("issuer SPKI encode failed: {e}")))?;
+
+    crate::crypto::verify::verify_signature_by_oid(
+        &parsed_crl.tbs_bytes,
+        &parsed_crl.signature_bytes,
+        &spki_der,
+        &parsed_crl.signature_algorithm_oid,
+    )
+    .map_err(|e| LtvError::Crl(format!("CRL signature verification failed: {e}")))
+}
+
+/// Check whether a certificate is revoked according to a CRL.
+///
+/// Performs the full CRL validation pipeline:
+/// 1. Parse CRL structure
+/// 2. Verify CRL signature against issuer's public key
+/// 3. Check CRL freshness (thisUpdate/nextUpdate vs validation_time)
+/// 4. Verify CRL issuer DN matches the certificate's issuer
+/// 5. Search for the certificate's serial number in revoked entries
+/// 6. Time-aware: if `revocationDate > validation_time` → `Valid`
+///
+/// Returns a [`ValidationStatus`] indicating the result.
+pub fn check_revocation(
+    crl_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<ValidationStatus, LtvError> {
+    let now = validation_time.unwrap_or_else(chrono::Utc::now);
+
+    // 1. Parse CRL
+    let parsed = parse_crl(crl_der)?;
+
+    // 2. Verify CRL signature
+    verify_crl_signature(&parsed, issuer)?;
+
+    // 3. Check CRL freshness: nextUpdate should be in the future
+    if let Some(next_update) = parsed.next_update {
+        if now > next_update {
+            log::warn!("CRL is stale: nextUpdate={next_update}, validation_time={now}");
+            // Stale CRL — we still process it but log a warning.
+            // The Java stack treats stale CRLs as valid for revocation
+            // checking but flags it in diagnostics.
+        }
+    }
+
+    // 4. Verify CRL issuer matches cert's issuer
+    // We compare raw DER issuer names
+    let cert_issuer_der = get_cert_issuer_der(cert)?;
+    if parsed.issuer_der != cert_issuer_der {
+        return Err(LtvError::Crl(
+            "CRL issuer does not match certificate issuer".into(),
         ));
     }
-    let value = &data[total_header..total_header + len];
-    let rest = &data[total_header + len..];
-    Ok((tag, value, rest))
+
+    // 5. Get the certificate's serial number for lookup
+    let cert_serial = get_cert_serial_body(cert);
+
+    // 6. Search for serial number in revoked entries
+    for entry in &parsed.revoked_entries {
+        if integer_bodies_equal(&entry.serial_number, &cert_serial) {
+            // Found! Time-aware check: if revocationDate > validation_time → Valid
+            if entry.revocation_time > now {
+                log::debug!(
+                    "cert serial found in CRL but revocation_time ({}) is in the future relative to validation_time ({})",
+                    entry.revocation_time, now
+                );
+                return Ok(ValidationStatus::Valid {
+                    source: RevocationSource::Crl,
+                    checked_at: now,
+                });
+            }
+
+            return Ok(ValidationStatus::Revoked {
+                source: RevocationSource::Crl,
+                reason: entry.reason,
+                revocation_time: entry.revocation_time,
+            });
+        }
+    }
+
+    // Serial not found in revoked list → Valid
+    Ok(ValidationStatus::Valid {
+        source: RevocationSource::Crl,
+        checked_at: now,
+    })
 }
 
-fn parse_der_length(data: &[u8]) -> Result<(usize, usize), String> {
-    if data.is_empty() {
-        return Err("empty length".into());
-    }
-    let first = data[0];
-    if first < 0x80 {
-        Ok((first as usize, 1))
-    } else if first == 0x80 {
-        Err("indefinite length not supported".into())
-    } else {
-        let num_bytes = (first & 0x7F) as usize;
-        if num_bytes > 4 || 1 + num_bytes > data.len() {
-            return Err("length encoding error".into());
-        }
-        let mut len: usize = 0;
-        for i in 0..num_bytes {
-            len = (len << 8) | (data[1 + i] as usize);
-        }
-        Ok((len, 1 + num_bytes))
-    }
+/// Extract the raw DER encoding of a certificate's issuer Name.
+fn get_cert_issuer_der(cert: &Certificate) -> Result<Vec<u8>, LtvError> {
+    use der::Encode;
+    cert.tbs_certificate
+        .issuer
+        .to_der()
+        .map_err(|e| LtvError::Crl(format!("cert issuer DER encode failed: {e}")))
+}
+
+/// Extract the serial number body from a certificate (stripped of leading zero padding).
+fn get_cert_serial_body(cert: &Certificate) -> Vec<u8> {
+    let serial = &cert.tbs_certificate.serial_number;
+    let bytes = serial.as_bytes();
+    parse_integer_body(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use der::Decode;
+    use crate::der_utils::{encode_integer_u64, encode_sequence_from_parts, encode_sequence_raw, encode_tlv};
+    use der::{Decode, Encode};
 
     #[test]
     fn test_crl_client_default() {
@@ -344,5 +713,287 @@ mod tests {
                 let _ = urls;
             }
         }
+    }
+
+    // ── CRL content parsing tests ─────────────────────────────────────
+
+    /// Build a synthetic DER-encoded CRL signed by the test intermediate CA.
+    ///
+    /// This constructs a minimal CRL by hand:
+    /// - TBSCertList with version, AlgId, issuer, thisUpdate, revokedCerts
+    /// - Signs it with the intermediate CA key
+    fn build_test_crl(
+        issuer_cert: &Certificate,
+        issuer_key_pem: &str,
+        revoked_serials: &[(Vec<u8>, &str)], // (serial_bytes, "YYMMDDHHMMSSZ")
+    ) -> Vec<u8> {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::Signer;
+        use rsa::signature::SignatureEncoding;
+        use pkcs8::DecodePrivateKey;
+        use sha2::Sha256;
+
+        // Build TBSCertList body
+        let mut tbs_body = Vec::new();
+
+        // version INTEGER 1 (v2)
+        tbs_body.extend_from_slice(&encode_integer_u64(1));
+
+        // signature AlgorithmIdentifier: sha256WithRSAEncryption
+        let sha256_rsa_oid: &[u8] = &[
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B,
+        ];
+        let alg_id = encode_sequence_from_parts(&[sha256_rsa_oid, &[0x05, 0x00]]);
+        tbs_body.extend_from_slice(&alg_id);
+
+        // issuer Name — use the issuer cert's subject DER
+        let issuer_name_der = issuer_cert
+            .tbs_certificate
+            .subject
+            .to_der()
+            .unwrap();
+        tbs_body.extend_from_slice(&issuer_name_der);
+
+        // thisUpdate UTCTime
+        let this_update_utc = encode_tlv(0x17, b"260101000000Z");
+        tbs_body.extend_from_slice(&this_update_utc);
+
+        // nextUpdate UTCTime
+        let next_update_utc = encode_tlv(0x17, b"270101000000Z");
+        tbs_body.extend_from_slice(&next_update_utc);
+
+        // revokedCertificates SEQUENCE OF
+        if !revoked_serials.is_empty() {
+            let mut revoked_body = Vec::new();
+            for (serial, time_str) in revoked_serials {
+                // Each entry: SEQUENCE { INTEGER serial, UTCTime revocationDate }
+                let serial_tlv = encode_tlv(0x02, serial);
+                let time_tlv = encode_tlv(0x17, time_str.as_bytes());
+                let entry = encode_sequence_from_parts(&[&serial_tlv, &time_tlv]);
+                revoked_body.extend_from_slice(&entry);
+            }
+            let revoked_seq = encode_sequence_raw(&revoked_body);
+            tbs_body.extend_from_slice(&revoked_seq);
+        }
+
+        // Wrap as TBSCertList SEQUENCE
+        let tbs_der = encode_sequence_raw(&tbs_body);
+
+        // Sign TBS with issuer's RSA key
+        let key_der = pem_rfc7468::decode_vec(issuer_key_pem.as_bytes())
+            .unwrap()
+            .1;
+        let private_key =
+            rsa::RsaPrivateKey::from_pkcs8_der(&key_der).unwrap();
+        let signing_key = SigningKey::<Sha256>::new(private_key);
+        let signature: rsa::pkcs1v15::Signature = signing_key.sign(&tbs_der);
+        let sig_bytes = signature.to_vec();
+
+        // Build outer CertificateList SEQUENCE
+        let outer_alg_id = alg_id.clone();
+        // BIT STRING: 0x00 unused bits prefix + signature bytes
+        let mut bit_string_value = vec![0x00];
+        bit_string_value.extend_from_slice(&sig_bytes);
+        let sig_bit_string = encode_tlv(0x03, &bit_string_value);
+
+        let cert_list =
+            encode_sequence_from_parts(&[&tbs_der, &outer_alg_id, &sig_bit_string]);
+        cert_list
+    }
+
+    fn load_test_cert(pem_str: &str) -> Certificate {
+        let (_, der) = pem_rfc7468::decode_vec(pem_str.as_bytes()).unwrap();
+        Certificate::from_der(&der).unwrap()
+    }
+
+    fn intermediate_ca_cert() -> Certificate {
+        let pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/intermediate_ca_cert.pem"
+        ));
+        load_test_cert(pem)
+    }
+
+    fn intermediate_ca_key_pem() -> &'static str {
+        // This is generated by gen-test-fixtures.sh and is gitignored.
+        // Tests that need it should check for its existence.
+        // For CI, the fixture script must be run first.
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/intermediate_ca_key.pem"
+        )
+    }
+
+    fn signer_cert() -> Certificate {
+        let pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/signer_cert.pem"
+        ));
+        load_test_cert(pem)
+    }
+
+    #[test]
+    fn test_parse_crl_empty_revoked_list() {
+        // We need the intermediate CA key to sign. If it doesn't exist, skip.
+        let key_path = intermediate_ca_key_pem();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found (run gen-test-fixtures.sh)");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let crl_der = build_test_crl(&issuer, &key_pem, &[]);
+        let parsed = parse_crl(&crl_der).unwrap();
+
+        assert!(parsed.revoked_entries.is_empty());
+        assert!(parsed.next_update.is_some());
+        assert_eq!(
+            parsed.this_update.to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn test_parse_crl_with_revoked_entries() {
+        let key_path = intermediate_ca_key_pem();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let revoked = vec![
+            (vec![0x01], "250601120000Z"),
+            (vec![0x00, 0xFF], "250701120000Z"),
+        ];
+        let crl_der = build_test_crl(&issuer, &key_pem, &revoked);
+        let parsed = parse_crl(&crl_der).unwrap();
+
+        assert_eq!(parsed.revoked_entries.len(), 2);
+        assert_eq!(parsed.revoked_entries[0].serial_number, vec![0x01]);
+        assert_eq!(parsed.revoked_entries[1].serial_number, vec![0xFF]);
+    }
+
+    #[test]
+    fn test_verify_crl_signature() {
+        let key_path = intermediate_ca_key_pem();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let crl_der = build_test_crl(&issuer, &key_pem, &[]);
+        let parsed = parse_crl(&crl_der).unwrap();
+
+        let result = verify_crl_signature(&parsed, &issuer);
+        assert!(result.is_ok(), "CRL signature should verify: {result:?}");
+    }
+
+    #[test]
+    fn test_verify_crl_signature_wrong_issuer() {
+        let key_path = intermediate_ca_key_pem();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let crl_der = build_test_crl(&issuer, &key_pem, &[]);
+        let parsed = parse_crl(&crl_der).unwrap();
+
+        // Use a different cert (signer) as "issuer" — should fail
+        let wrong_issuer = signer_cert();
+        let result = verify_crl_signature(&parsed, &wrong_issuer);
+        assert!(result.is_err(), "wrong issuer should fail verification");
+    }
+
+    #[test]
+    fn test_check_revocation_not_revoked() {
+        let key_path = intermediate_ca_key_pem();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        // CRL with no revoked entries
+        let crl_der = build_test_crl(&issuer, &key_pem, &[]);
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let status = check_revocation(&crl_der, &cert, &issuer, Some(validation_time)).unwrap();
+        assert!(status.is_valid(), "should be valid: {status}");
+    }
+
+    #[test]
+    fn test_check_revocation_cert_is_revoked() {
+        let key_path = intermediate_ca_key_pem();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        // Get the signer cert's serial number
+        let serial = get_cert_serial_body(&cert);
+
+        // CRL with the signer's serial revoked
+        let revoked = vec![(serial, "250601120000Z")];
+        let crl_der = build_test_crl(&issuer, &key_pem, &revoked);
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let status = check_revocation(&crl_der, &cert, &issuer, Some(validation_time)).unwrap();
+        assert!(status.is_revoked(), "should be revoked: {status}");
+    }
+
+    #[test]
+    fn test_check_revocation_time_aware_future_revocation() {
+        let key_path = intermediate_ca_key_pem();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let serial = get_cert_serial_body(&cert);
+
+        // Revocation date is 2027-01-01 but validation_time is 2026-06-01
+        // → cert should be VALID at validation_time
+        let revoked = vec![(serial, "270101120000Z")];
+        let crl_der = build_test_crl(&issuer, &key_pem, &revoked);
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let status = check_revocation(&crl_der, &cert, &issuer, Some(validation_time)).unwrap();
+        assert!(
+            status.is_valid(),
+            "should be valid (revocation in future): {status}"
+        );
+    }
+
+    #[test]
+    fn test_parse_crl_invalid_data() {
+        let result = parse_crl(&[0x04, 0x00]); // OCTET STRING, not SEQUENCE
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("SEQUENCE"));
+    }
+
+    #[test]
+    fn test_parse_revocation_reason_unspecified() {
+        // No extensions → Unspecified
+        let reason = parse_revocation_reason(&[]);
+        assert_eq!(reason, RevocationReason::Unspecified);
     }
 }

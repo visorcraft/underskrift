@@ -23,9 +23,26 @@ pub mod chain;
 pub mod crl;
 pub mod dss;
 pub mod ocsp;
+pub mod revocation;
+pub mod status;
+pub mod x509_ext;
 
 // Re-exports
 pub use chain::ChainBuilder;
 pub use crl::CrlClient;
 pub use dss::{DssBuilder, VriEntry, compute_vri_key};
-pub use ocsp::{OcspClient, AiaAccessMethod, extract_aia_urls};
+pub use ocsp::{
+    OcspClient, AiaAccessMethod, extract_aia_urls,
+    CertStatus, SingleResponse, ParsedBasicOcspResponse, ResponderId,
+    build_ocsp_request_with_nonce, has_ocsp_nocheck_extension,
+    parse_ocsp_response, check_revocation as ocsp_check_revocation,
+};
+pub use revocation::{RevocationConfig, check_certificate_revocation};
+#[cfg(feature = "blocking")]
+pub use revocation::check_certificate_revocation_blocking;
+pub use status::{ValidationStatus, RevocationSource, RevocationReason, resolve_priority};
+pub use x509_ext::{
+    KeyUsageBits, CertRole,
+    check_basic_constraints, check_key_usage, check_extended_key_usage,
+    has_extension, validate_extensions_for_role,
+};

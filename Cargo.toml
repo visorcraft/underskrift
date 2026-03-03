@@ -70,7 +70,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 
 # HTTP client — optional (TSP, OCSP, CRL)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
-tokio = { version = "1", features = ["rt", "macros"], optional = true }
+tokio = { version = "1", features = ["rt", "macros", "time"], optional = true }
 
 # Visible signatures — optional
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }

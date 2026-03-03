@@ -4,6 +4,7 @@
 //! each signature in a PDF document. Follows the plan's specification
 //! for rich validation results.
 
+use crate::policy::PolicyResult;
 use crate::verify::chain_verify::CertValidity;
 use crate::verify::extractor::SignatureType;
 
@@ -83,6 +84,26 @@ pub struct SignatureVerificationResult {
     /// Trust anchor subject, if chain is trusted
     pub trust_anchor: Option<String>,
 
+    /// Overall revocation status from path validation.
+    ///
+    /// `Some(...)` when online path validation was performed (requires `ltv` feature
+    /// and `allow_online(true)`). `None` for offline-only validation.
+    #[cfg(feature = "ltv")]
+    pub revocation_status: Option<crate::ltv::status::ValidationStatus>,
+    /// Placeholder when `ltv` feature is not enabled.
+    #[cfg(not(feature = "ltv"))]
+    pub revocation_status: Option<()>,
+
+    /// Per-certificate revocation status from path validation.
+    ///
+    /// Each entry is `(subject_name, revocation_status)` for each certificate
+    /// in the chain. Empty when online path validation was not performed.
+    #[cfg(feature = "ltv")]
+    pub per_cert_revocation: Vec<(String, crate::ltv::status::ValidationStatus)>,
+    /// Placeholder when `ltv` feature is not enabled.
+    #[cfg(not(feature = "ltv"))]
+    pub per_cert_revocation: Vec<(String, ())>,
+
     /// Detected PAdES conformance level
     pub pades_level: DetectedPadesLevel,
 
@@ -102,6 +123,13 @@ pub struct SignatureVerificationResult {
     /// nor valid DSS-only updates. `None` if revision analysis was not performed.
     pub extended_by_non_safe_updates: Option<bool>,
 
+    /// Validation policy result, if a policy was configured.
+    ///
+    /// Contains the three-valued conclusion (PASSED / FAILED / INDETERMINATE),
+    /// the policy identifier, and individual check results.
+    /// `None` if no policy was configured on the verifier.
+    pub policy_result: Option<PolicyResult>,
+
     /// Human-readable summary
     pub summary: String,
 }
@@ -117,6 +145,12 @@ pub struct VerificationReport {
     pub valid_count: usize,
     /// Number of invalid/indeterminate signatures
     pub invalid_count: usize,
+    /// Number of signatures that passed the configured policy
+    pub policy_passed_count: usize,
+    /// Number of signatures that failed the configured policy
+    pub policy_failed_count: usize,
+    /// Number of signatures with indeterminate policy result
+    pub policy_indeterminate_count: usize,
     /// Overall document status summary
     pub summary: String,
 }
@@ -130,5 +164,16 @@ impl VerificationReport {
     /// Whether any signature is valid (even if not all are).
     pub fn any_valid(&self) -> bool {
         self.valid_count > 0
+    }
+
+    /// Whether all signatures passed the configured policy.
+    ///
+    /// Returns `true` if at least one policy was evaluated and all concluded PASSED.
+    /// Returns `false` if no policy was configured or any policy concluded
+    /// FAILED/INDETERMINATE.
+    pub fn all_policies_passed(&self) -> bool {
+        self.policy_passed_count > 0
+            && self.policy_failed_count == 0
+            && self.policy_indeterminate_count == 0
     }
 }

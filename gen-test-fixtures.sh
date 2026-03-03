@@ -81,16 +81,17 @@ openssl pkcs12 -export -legacy \
     -passout "pass:${PASSWORD}"
 
 echo "=== Cleaning up intermediate artifacts ==="
-rm -f intermediate_ca_key.pem intermediate_ca.csr signer.csr intermediate_ca_cert.srl
+rm -f intermediate_ca.csr signer.csr intermediate_ca_cert.srl
 
 echo ""
 echo "=== Generated test fixtures ==="
-echo "  Root CA cert:         ca_cert.pem"
-echo "  Root CA key:          ca_key.pem  (DO NOT COMMIT)"
-echo "  Intermediate CA cert: intermediate_ca_cert.pem"
-echo "  Signer cert:          signer_cert.pem"
-echo "  Signer key:           signer_key.pem  (DO NOT COMMIT)"
-echo "  PKCS#12 bundle:       signer.p12  (DO NOT COMMIT, password: ${PASSWORD})"
-echo "  Full chain:           chain.pem"
+echo "  Root CA cert:            ca_cert.pem"
+echo "  Root CA key:             ca_key.pem  (DO NOT COMMIT)"
+echo "  Intermediate CA cert:    intermediate_ca_cert.pem"
+echo "  Intermediate CA key:     intermediate_ca_key.pem  (DO NOT COMMIT)"
+echo "  Signer cert:             signer_cert.pem"
+echo "  Signer key:              signer_key.pem  (DO NOT COMMIT)"
+echo "  PKCS#12 bundle:          signer.p12  (DO NOT COMMIT, password: ${PASSWORD})"
+echo "  Full chain:              chain.pem"
 echo ""
 echo "Run tests with: cd ../.. && cargo test --all-features"

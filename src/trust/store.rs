@@ -255,7 +255,21 @@ impl TrustStore {
             }
 
             // Verify signature of cert against issuer's public key
-            verify_signature(cert, issuer_cert)?;
+            crate::crypto::verify::verify_certificate_signature(cert, issuer_cert)?;
+
+            // Validate extensions: intermediates must have CA:TRUE + keyCertSign
+            #[cfg(feature = "ltv")]
+            {
+                use crate::ltv::x509_ext::{validate_extensions_for_role, CertRole};
+                validate_extensions_for_role(issuer_cert, CertRole::IntermediateCa).map_err(
+                    |e| {
+                        TrustError::SignatureVerification(format!(
+                            "intermediate at index {} failed extension validation: {e}",
+                            i + 1
+                        ))
+                    },
+                )?;
+            }
         }
 
         // The last cert in the chain must be issued by a trust anchor
@@ -266,7 +280,7 @@ impl TrustStore {
         if last.tbs_certificate.issuer == last.tbs_certificate.subject {
             if self.contains_der(&last.to_der().unwrap_or_default()) {
                 // Self-signed cert is directly trusted — verify its self-signature
-                verify_signature(last, last)?;
+                crate::crypto::verify::verify_certificate_signature(last, last)?;
                 let anchor = self.find_issuer(last).unwrap(); // must exist since contains_der passed
                 return Ok(anchor);
             }
@@ -279,7 +293,7 @@ impl TrustStore {
             })?;
 
         // Verify the last certificate's signature against the anchor
-        verify_signature(last, anchor)?;
+        crate::crypto::verify::verify_certificate_signature(last, anchor)?;
 
         // Check time validity of the anchor
         if let Some(time) = validation_time {
@@ -317,97 +331,4 @@ impl std::fmt::Debug for TrustStore {
     }
 }
 
-// ── Signature verification helper ────────────────────────────────────────────
-
-/// Verify the signature on `cert` using `issuer`'s public key.
-///
-/// Supports RSA PKCS#1 v1.5 (with SHA-256, SHA-384, SHA-512) and
-/// ECDSA (P-256 with SHA-256, P-384 with SHA-384).
-fn verify_signature(cert: &Certificate, issuer: &Certificate) -> Result<(), TrustError> {
-    use const_oid::db;
-
-    // Get the issuer's public key info
-    let issuer_spki = &issuer.tbs_certificate.subject_public_key_info;
-
-    // Get the TBS (to-be-signed) bytes and signature from the certificate
-    let tbs_bytes = cert
-        .tbs_certificate
-        .to_der()
-        .map_err(|e| TrustError::SignatureVerification(format!("TBS encoding failed: {e}")))?;
-    let signature_bytes = cert.signature.raw_bytes();
-    let sig_alg_oid = &cert.signature_algorithm.oid;
-
-    // Decode the issuer's SPKI to DER bytes for signature verification
-    let spki_der = issuer_spki
-        .to_der()
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI encoding failed: {e}")))?;
-
-    // Determine algorithm from OID and verify
-    // We re-decode spki_ref for each branch since the key types take ownership.
-    if *sig_alg_oid == db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION {
-        verify_rsa_signature::<sha2::Sha256>(&tbs_bytes, signature_bytes, &spki_der)
-    } else if *sig_alg_oid == db::rfc5912::SHA_384_WITH_RSA_ENCRYPTION {
-        verify_rsa_signature::<sha2::Sha384>(&tbs_bytes, signature_bytes, &spki_der)
-    } else if *sig_alg_oid == db::rfc5912::SHA_512_WITH_RSA_ENCRYPTION {
-        verify_rsa_signature::<sha2::Sha512>(&tbs_bytes, signature_bytes, &spki_der)
-    } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_256 {
-        verify_ecdsa_p256_signature(&tbs_bytes, signature_bytes, &spki_der)
-    } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_384 {
-        verify_ecdsa_p384_signature(&tbs_bytes, signature_bytes, &spki_der)
-    } else {
-        Err(TrustError::UnsupportedAlgorithm(format!(
-            "signature algorithm OID: {sig_alg_oid}"
-        )))
-    }
-}
-
-fn verify_rsa_signature<D: digest::Digest + const_oid::AssociatedOid>(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    use rsa::pkcs1v15::Pkcs1v15Sign;
-    use rsa::RsaPublicKey;
-    use spki::SubjectPublicKeyInfoRef;
-
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
-    let pub_key = RsaPublicKey::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("RSA key decode failed: {e}")))?;
-
-    let hash = D::digest(tbs);
-    let scheme = Pkcs1v15Sign::new::<D>();
-    pub_key
-        .verify(scheme, &hash, sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("RSA signature invalid: {e}")))
-}
-
-fn verify_ecdsa_p256_signature(tbs: &[u8], sig: &[u8], spki_der: &[u8]) -> Result<(), TrustError> {
-    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-    use spki::SubjectPublicKeyInfoRef;
-
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
-    let vk = VerifyingKey::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-256 key decode failed: {e}")))?;
-    let signature = Signature::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-256 sig decode failed: {e}")))?;
-
-    vk.verify(tbs, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-256 invalid: {e}")))
-}
-
-fn verify_ecdsa_p384_signature(tbs: &[u8], sig: &[u8], spki_der: &[u8]) -> Result<(), TrustError> {
-    use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-    use spki::SubjectPublicKeyInfoRef;
-
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
-    let vk = VerifyingKey::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-384 key decode failed: {e}")))?;
-    let signature = Signature::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-384 sig decode failed: {e}")))?;
-
-    vk.verify(tbs, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-384 invalid: {e}")))
-}
+// Signature verification is now in crate::crypto::verify

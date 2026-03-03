@@ -34,6 +34,12 @@ pub mod report;
 
 // Re-export key types for convenience
 pub use chain_verify::CertValidity;
+#[cfg(feature = "ltv")]
+pub use chain_verify::{
+    CertPathEntry, PathValidationResult, validate_certificate_path,
+};
+#[cfg(all(feature = "ltv", feature = "blocking"))]
+pub use chain_verify::validate_certificate_path_blocking;
 pub use extractor::{ExtractedSignature, SignatureType};
 pub use report::{
     CryptoValidity, DetectedPadesLevel, SignatureStatus, SignatureVerificationResult,
@@ -43,7 +49,15 @@ pub use report::{
 use crate::core::revision::{DefaultSafeObjectClassifier, RevisionAnalysis};
 use crate::crypto::algorithm::DigestAlgorithm;
 use crate::error::{PdfSignError, VerifyError};
+use crate::policy::SignatureValidationPolicy;
 use crate::trust::TrustStoreSet;
+
+#[cfg(feature = "ltv")]
+use crate::ltv::crl::CrlClient;
+#[cfg(feature = "ltv")]
+use crate::ltv::ocsp::OcspClient;
+#[cfg(feature = "ltv")]
+use crate::ltv::revocation::RevocationConfig;
 
 /// PDF signature verifier.
 ///
@@ -61,6 +75,21 @@ pub struct SignatureVerifier<'a> {
     /// When false, only embedded validation data is used.
     /// Defaults to false (offline-only for now; online comes in Phase 4).
     allow_online: bool,
+    /// Validation policy to apply after verification.
+    ///
+    /// When set, the policy is evaluated for each signature after all
+    /// sub-verifications are complete. The result is stored in
+    /// `SignatureVerificationResult.policy_result`.
+    policy: Option<Box<dyn SignatureValidationPolicy>>,
+    /// Revocation checking configuration (requires `ltv` feature).
+    #[cfg(feature = "ltv")]
+    revocation_config: Option<RevocationConfig>,
+    /// CRL client for fetching CRLs (requires `ltv` feature).
+    #[cfg(feature = "ltv")]
+    crl_client: Option<CrlClient>,
+    /// OCSP client for querying OCSP responders (requires `ltv` feature).
+    #[cfg(feature = "ltv")]
+    ocsp_client: Option<OcspClient>,
 }
 
 impl<'a> SignatureVerifier<'a> {
@@ -69,12 +98,72 @@ impl<'a> SignatureVerifier<'a> {
         Self {
             trust_stores,
             allow_online: false,
+            policy: None,
+            #[cfg(feature = "ltv")]
+            revocation_config: None,
+            #[cfg(feature = "ltv")]
+            crl_client: None,
+            #[cfg(feature = "ltv")]
+            ocsp_client: None,
         }
     }
 
     /// Set whether online validation (OCSP/CRL) is allowed.
     pub fn allow_online(mut self, allow: bool) -> Self {
         self.allow_online = allow;
+        self
+    }
+
+    /// Set a validation policy to apply after verification.
+    ///
+    /// When set, the policy is evaluated for each signature after all
+    /// sub-verifications are complete. The three-valued conclusion
+    /// (PASSED / FAILED / INDETERMINATE) is stored in
+    /// `SignatureVerificationResult.policy_result`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use underskrift::verify::SignatureVerifier;
+    /// use underskrift::policy::BasicPdfSignaturePolicy;
+    /// use underskrift::trust::TrustStoreSet;
+    ///
+    /// let trust_set = TrustStoreSet::new();
+    /// let verifier = SignatureVerifier::new(&trust_set)
+    ///     .policy(Box::new(BasicPdfSignaturePolicy::new()));
+    /// ```
+    pub fn policy(mut self, policy: Box<dyn SignatureValidationPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Set the revocation checking configuration.
+    ///
+    /// When set together with `allow_online(true)`, the verifier will perform
+    /// per-certificate OCSP and CRL revocation checks during chain validation.
+    ///
+    /// Requires the `ltv` feature.
+    #[cfg(feature = "ltv")]
+    pub fn revocation_config(mut self, config: RevocationConfig) -> Self {
+        self.revocation_config = Some(config);
+        self
+    }
+
+    /// Set the CRL client for fetching CRLs.
+    ///
+    /// Requires the `ltv` feature.
+    #[cfg(feature = "ltv")]
+    pub fn crl_client(mut self, client: CrlClient) -> Self {
+        self.crl_client = Some(client);
+        self
+    }
+
+    /// Set the OCSP client for querying OCSP responders.
+    ///
+    /// Requires the `ltv` feature.
+    #[cfg(feature = "ltv")]
+    pub fn ocsp_client(mut self, client: OcspClient) -> Self {
+        self.ocsp_client = Some(client);
         self
     }
 
@@ -115,6 +204,22 @@ impl<'a> SignatureVerifier<'a> {
             .map(|r| r.modifications_after_signing)
             .unwrap_or(false);
 
+        // Policy stats
+        let mut policy_passed_count = 0;
+        let mut policy_failed_count = 0;
+        let mut policy_indeterminate_count = 0;
+        for r in &results {
+            if let Some(ref pr) = r.policy_result {
+                match pr.conclusion {
+                    crate::policy::PolicyConclusion::Passed => policy_passed_count += 1,
+                    crate::policy::PolicyConclusion::Failed => policy_failed_count += 1,
+                    crate::policy::PolicyConclusion::Indeterminate => {
+                        policy_indeterminate_count += 1
+                    }
+                }
+            }
+        }
+
         let summary = if valid_count == results.len() {
             format!("all {} signatures valid and trusted", results.len())
         } else if valid_count > 0 {
@@ -133,6 +238,9 @@ impl<'a> SignatureVerifier<'a> {
             document_modified,
             valid_count,
             invalid_count,
+            policy_passed_count,
+            policy_failed_count,
+            policy_indeterminate_count,
             summary,
         })
     }
@@ -218,9 +326,46 @@ impl<'a> SignatureVerifier<'a> {
             };
 
         // --- Step C: Certificate chain validation ---
-        let (certificate_validity, chain_trusted, trust_anchor) =
+        // When allow_online + ltv feature: full path validation with revocation
+        // When offline: basic chain verification only
+        #[cfg(feature = "ltv")]
+        let (certificate_validity, chain_trusted, trust_anchor, revocation_status, per_cert_revocation) =
             if let Some(ref signer_cert) = signer_cert {
-                // Use the signature trust store
+                if let Some(sig_store) = self.trust_stores.sig() {
+                    if self.allow_online {
+                        // Online path validation with per-cert revocation checking
+                        self.verify_chain_online(signer_cert, &embedded_certs, sig_store)
+                    } else {
+                        // Offline-only chain verification
+                        let chain_result =
+                            chain_verify::verify_chain(signer_cert, &embedded_certs, sig_store);
+                        all_issues.extend(chain_result.issues);
+                        (
+                            chain_result.cert_validity,
+                            chain_result.trusted,
+                            chain_result.trust_anchor_subject,
+                            None,
+                            Vec::new(),
+                        )
+                    }
+                } else {
+                    all_issues.push("no signature trust store configured".to_string());
+                    (
+                        CertValidity::ValidationError("no trust store".to_string()),
+                        false,
+                        None,
+                        None,
+                        Vec::new(),
+                    )
+                }
+            } else {
+                all_issues.push("no signer certificate found — cannot validate chain".to_string());
+                (CertValidity::ChainIncomplete, false, None, None, Vec::new())
+            };
+
+        #[cfg(not(feature = "ltv"))]
+        let (certificate_validity, chain_trusted, trust_anchor, revocation_status, per_cert_revocation) =
+            if let Some(ref signer_cert) = signer_cert {
                 if let Some(sig_store) = self.trust_stores.sig() {
                     let chain_result =
                         chain_verify::verify_chain(signer_cert, &embedded_certs, sig_store);
@@ -229,6 +374,8 @@ impl<'a> SignatureVerifier<'a> {
                         chain_result.cert_validity,
                         chain_result.trusted,
                         chain_result.trust_anchor_subject,
+                        None::<()>,
+                        Vec::<(String, ())>::new(),
                     )
                 } else {
                     all_issues.push("no signature trust store configured".to_string());
@@ -236,11 +383,13 @@ impl<'a> SignatureVerifier<'a> {
                         CertValidity::ValidationError("no trust store".to_string()),
                         false,
                         None,
+                        None,
+                        Vec::new(),
                     )
                 }
             } else {
                 all_issues.push("no signer certificate found — cannot validate chain".to_string());
-                (CertValidity::ChainIncomplete, false, None)
+                (CertValidity::ChainIncomplete, false, None, None, Vec::new())
             };
 
         // --- Step D: Extract signer name ---
@@ -284,7 +433,8 @@ impl<'a> SignatureVerifier<'a> {
 
         let summary = build_summary(&status, &all_issues);
 
-        SignatureVerificationResult {
+        // Build the result (policy_result is filled in Step H)
+        let mut sig_result = SignatureVerificationResult {
             field_name: sig.field_name.clone(),
             status,
             signature_type: sig.signature_type.clone(),
@@ -299,12 +449,98 @@ impl<'a> SignatureVerifier<'a> {
             certificate_validity,
             chain_trusted,
             trust_anchor,
+            revocation_status,
+            per_cert_revocation,
             pades_level,
             modifications_after_signing,
             covers_whole_document_revision: covers_whole_doc_rev,
             extended_by_non_safe_updates: extended_by_non_safe,
+            policy_result: None,
             summary,
+        };
+
+        // --- Step H: Policy evaluation ---
+        if let Some(ref policy) = self.policy {
+            sig_result.policy_result = Some(policy.evaluate(&sig_result));
         }
+
+        sig_result
+    }
+
+    /// Perform online path validation with revocation checking.
+    ///
+    /// Uses `validate_certificate_path_blocking` to run the async revocation
+    /// checks synchronously. Falls back to basic chain verification if
+    /// the required clients are not configured.
+    #[cfg(feature = "ltv")]
+    fn verify_chain_online(
+        &self,
+        signer_cert: &x509_cert::Certificate,
+        embedded_certs: &[x509_cert::Certificate],
+        trust_store: &crate::trust::TrustStore,
+    ) -> (
+        CertValidity,
+        bool,
+        Option<String>,
+        Option<crate::ltv::status::ValidationStatus>,
+        Vec<(String, crate::ltv::status::ValidationStatus)>,
+    ) {
+        let config = self
+            .revocation_config
+            .clone()
+            .unwrap_or_else(RevocationConfig::default);
+        let crl = self
+            .crl_client
+            .clone()
+            .unwrap_or_else(CrlClient::new);
+        let ocsp = self
+            .ocsp_client
+            .clone()
+            .unwrap_or_else(OcspClient::new);
+
+        // Run the full async path validation using block_on
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime");
+        let path_result = rt.block_on(chain_verify::validate_certificate_path(
+            signer_cert,
+            embedded_certs,
+            trust_store,
+            &config,
+            &crl,
+            &ocsp,
+            None,
+        ));
+
+        // Convert PathValidationResult to the tuple format expected by verify_single_signature
+        let chain_trusted = path_result.trust_anchor.is_some()
+            && !path_result.overall_status.is_revoked()
+            && !path_result.overall_status.is_invalid();
+
+        let cert_validity = if path_result.overall_status.is_revoked() {
+            CertValidity::Revoked(format!("{}", path_result.overall_status))
+        } else if path_result.overall_status.is_invalid() {
+            CertValidity::ValidationError(format!("{}", path_result.overall_status))
+        } else if path_result.trust_anchor.is_none() {
+            CertValidity::UntrustedRoot
+        } else {
+            CertValidity::Valid
+        };
+
+        let per_cert: Vec<(String, crate::ltv::status::ValidationStatus)> = path_result
+            .per_cert_status
+            .into_iter()
+            .map(|e| (e.subject, e.revocation_status))
+            .collect();
+
+        (
+            cert_validity,
+            chain_trusted,
+            path_result.trust_anchor,
+            Some(path_result.overall_status),
+            per_cert,
+        )
     }
 }
 
