@@ -1,0 +1,92 @@
+[package]
+name = "underskrift"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Production-grade PDF digital signing library — PAdES B-B through B-LTA, PKCS#7, visible/invisible signatures, LTV, and verification"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/underskrift"
+keywords = ["pdf", "signing", "pades", "pkcs7", "digital-signature"]
+categories = ["cryptography", "parser-implementations"]
+
+[features]
+default = ["tsp", "ltv", "visual", "verify"]
+
+# Network-dependent features
+tsp      = ["dep:reqwest", "dep:tokio"]       # RFC 3161 timestamping
+ltv      = ["tsp"]                             # LTV requires TSP + OCSP/CRL fetching
+blocking = ["dep:tokio"]                       # Sync wrappers via block_on()
+
+# Optional modules
+visual   = ["dep:image", "dep:subsetter"]      # Visible signature appearances + font subsetting
+verify   = []                                  # Signature verification & validation
+saci     = ["dep:quick-xml"]                   # SACI AuthnContext X.509 extension parsing (RFC 7773)
+svt      = ["dep:josekit", "dep:serde", "dep:serde_json"]  # RFC 9321 Signature Validation Tokens
+report   = ["verify", "dep:uppsala"]                      # ETSI TS 119 102-2 validation reports
+
+[dependencies]
+# PDF parsing and manipulation
+lopdf = "0.39"
+
+# CMS / PKCS#7 / X.509 (RustCrypto ecosystem)
+cms = { version = "0.2", features = ["alloc"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+der = { version = "0.7", features = ["alloc", "oid"] }
+spki = "0.7"
+const-oid = { version = "0.9", features = ["db"] }
+
+# Signing algorithms
+rsa = { version = "0.9", features = ["sha2"] }
+ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = { version = "2", features = ["pem"] }
+signature = "2"
+
+# Hashing
+sha2 = "0.10"
+sha1 = "0.10"
+digest = "0.10"
+
+# Key loading
+pkcs8 = { version = "0.10", features = ["pem", "alloc"] }
+p12 = "0.6"
+pem-rfc7468 = "0.7"
+
+# Error handling
+thiserror = "2"
+
+# Hex encoding for /Contents
+hex = "0.4"
+
+# Base64 decoding (PEM parsing)
+base64 = "0.22"
+
+# Logging
+log = "0.4"
+
+# Time — for signing time attributes
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# HTTP client — optional (TSP, OCSP, CRL)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
+
+# Visible signatures — optional
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+subsetter = { version = "0.2", optional = true }
+
+# XML parsing — optional (SACI)
+quick-xml = { version = "0.37", optional = true }
+
+# JWT / SVT — optional
+josekit = { version = "0.10", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+# ETSI validation reports — optional
+uppsala = { path = "../../xml/uppsala", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

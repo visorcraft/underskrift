@@ -1,0 +1,9 @@
+# Build artifacts
+/target/
+
+# Private keys and PKCS#12 bundles — NEVER commit these
+tests/fixtures/ca_key.pem
+tests/fixtures/signer_key.pem
+tests/fixtures/signer.p12
+tests/fixtures/ca_cert.srl
+tests/fixtures/intermediate_ca_cert.srl

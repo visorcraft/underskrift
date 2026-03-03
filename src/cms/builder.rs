@@ -1,0 +1,732 @@
+//! CMS/PKCS#7 SignedData builder for PDF signatures.
+//!
+//! Constructs the CMS `SignedData` structure that goes into the PDF's
+//! `/Contents` field. Handles signed attributes, unsigned attributes,
+//! certificate embedding, and size estimation.
+//!
+//! Supports both PAdES (ETSI.CAdES.detached) and traditional (adbe.pkcs7.detached)
+//! SubFilter modes. PAdES requires `signingCertificateV2` and omits `signingTime`;
+//! traditional allows `signingTime` and doesn't require `signingCertificateV2`.
+
+use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
+use cms::content_info::{CmsVersion, ContentInfo};
+use cms::signed_data::{
+    CertificateSet, EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo, SignerInfos,
+};
+use const_oid::db::rfc5911;
+use const_oid::db::rfc5912;
+use der::asn1::{OctetString, SetOfVec};
+use der::{Any, Decode, Encode, Tag};
+use spki::AlgorithmIdentifierOwned;
+use x509_cert::attr::{Attribute, AttributeValue};
+use x509_cert::Certificate;
+
+use crate::crypto::algorithm::{DigestAlgorithm, SignatureAlgorithm};
+use crate::crypto::traits::CryptoSigner;
+use crate::error::CmsError;
+
+/// The mode of CMS construction — affects which signed attributes are included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmsProfile {
+    /// PAdES (ETSI.CAdES.detached): requires signingCertificateV2, omits signingTime
+    Pades,
+    /// Traditional (adbe.pkcs7.detached): allows signingTime, no signingCertificateV2 required
+    Traditional,
+}
+
+impl Default for CmsProfile {
+    fn default() -> Self {
+        Self::Pades
+    }
+}
+
+/// Builder for CMS SignedData structures suitable for PDF signatures.
+pub struct PdfCmsBuilder<'a> {
+    /// The signer providing key material and certificates
+    signer: &'a dyn CryptoSigner,
+    /// Whether to embed the full certificate chain
+    embed_chain: bool,
+    /// Signing time (None = omit, Some = include in signed attrs)
+    /// For PAdES, this is always omitted regardless of this setting.
+    signing_time: Option<chrono::NaiveDateTime>,
+    /// CMS profile (PAdES vs Traditional)
+    profile: CmsProfile,
+}
+
+impl<'a> PdfCmsBuilder<'a> {
+    /// Create a new CMS builder.
+    pub fn new(signer: &'a dyn CryptoSigner) -> Self {
+        Self {
+            signer,
+            embed_chain: true,
+            signing_time: None,
+            profile: CmsProfile::default(),
+        }
+    }
+
+    /// Set whether to embed the full certificate chain.
+    pub fn embed_chain(mut self, embed: bool) -> Self {
+        self.embed_chain = embed;
+        self
+    }
+
+    /// Set the signing time (only used in Traditional mode).
+    pub fn signing_time(mut self, time: chrono::NaiveDateTime) -> Self {
+        self.signing_time = Some(time);
+        self
+    }
+
+    /// Set the CMS profile.
+    pub fn profile(mut self, profile: CmsProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Estimate the size of the final DER-encoded CMS signature.
+    ///
+    /// This is used to determine how large the `/Contents` placeholder
+    /// needs to be. Returns a conservative upper bound.
+    pub fn estimate_size(&self) -> usize {
+        let chain = self.signer.certificate_chain_der();
+        let cert_size: usize = if self.embed_chain {
+            chain.iter().map(|c| c.len()).sum::<usize>() + chain.len() * 32 // ASN.1 overhead per cert
+        } else {
+            self.signer.certificate_der().len() + 32
+        };
+
+        // Signature value: RSA up to 512 bytes (4096-bit), ECDSA up to 144 bytes
+        let sig_size = match self.signer.signature_algorithm() {
+            SignatureAlgorithm::RsaPkcs1v15 | SignatureAlgorithm::RsaPss => 512,
+            _ => 144,
+        };
+
+        // Signed attributes: ~256 bytes, ASN.1 overhead: ~512 bytes
+        // Add 2KB buffer for safety
+        cert_size + sig_size + 256 + 512 + 2048
+    }
+
+    /// Build and sign the CMS SignedData for the given data hash.
+    ///
+    /// `data_hash` is the hash of the ByteRange-selected portions of the PDF.
+    /// The hash must have been computed using the signer's configured digest algorithm.
+    ///
+    /// Returns the DER-encoded `ContentInfo` wrapping the `SignedData`.
+    pub fn build(&self, data_hash: &[u8]) -> Result<Vec<u8>, CmsError> {
+        // 1. Parse the signer's certificate to extract issuer + serial
+        let cert_der = self.signer.certificate_der();
+        let cert = Certificate::from_der(cert_der)
+            .map_err(|e| CmsError::Der(format!("failed to parse signer certificate: {e}")))?;
+
+        // 2. Build SignerIdentifier (IssuerAndSerialNumber)
+        let sid = SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
+            issuer: cert.tbs_certificate.issuer.clone(),
+            serial_number: cert.tbs_certificate.serial_number.clone(),
+        });
+
+        // 3. Determine algorithm identifiers
+        let digest_alg = self.digest_algorithm_identifier();
+        let sig_alg = self.signature_algorithm_identifier()?;
+
+        // 4. Build the set of digest algorithms (just one)
+        let mut digest_algorithms = SetOfVec::new();
+        digest_algorithms
+            .insert(digest_alg.clone())
+            .map_err(|e| CmsError::Builder(format!("failed to build digest algorithm set: {e}")))?;
+
+        // 5. Build EncapsulatedContentInfo — detached (no econtent for PDF signing)
+        let encap_content_info = EncapsulatedContentInfo {
+            econtent_type: rfc5911::ID_DATA,
+            econtent: None,
+        };
+
+        // 6. Build signed attributes
+        let signed_attrs = self.build_signed_attributes(data_hash, &cert)?;
+
+        // 7. Compute the signature over the DER-encoded signed attributes
+        //    Per RFC 5652 §5.4: encode the signed attributes as a SET OF,
+        //    then hash and sign that encoding.
+        let attrs_to_sign = self.encode_attrs_for_signing(&signed_attrs)?;
+        let attrs_hash = self.signer.digest_algorithm().digest(&attrs_to_sign);
+        let signature_bytes = self
+            .signer
+            .sign_hash(&attrs_hash)
+            .map_err(|e| CmsError::Builder(format!("signing failed: {e}")))?;
+
+        // 8. Build SignerInfo
+        let signer_info = SignerInfo {
+            version: CmsVersion::V1, // V1 when using IssuerAndSerialNumber
+            sid,
+            digest_alg,
+            signed_attrs: Some(signed_attrs),
+            signature_algorithm: sig_alg,
+            signature: OctetString::new(signature_bytes).map_err(|e| {
+                CmsError::Der(format!("failed to create signature octet string: {e}"))
+            })?,
+            unsigned_attrs: None,
+        };
+
+        let mut signer_infos_set = SetOfVec::new();
+        signer_infos_set
+            .insert(signer_info)
+            .map_err(|e| CmsError::Builder(format!("failed to build signer infos set: {e}")))?;
+
+        // 9. Build the certificate set
+        let certificates = self.build_certificate_set()?;
+
+        // 10. Assemble SignedData
+        let signed_data = SignedData {
+            version: CmsVersion::V1,
+            digest_algorithms,
+            encap_content_info,
+            certificates: Some(certificates),
+            crls: None,
+            signer_infos: SignerInfos(signer_infos_set),
+        };
+
+        // 11. Wrap in ContentInfo and DER-encode
+        let signed_data_der = signed_data
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("failed to DER-encode SignedData: {e}")))?;
+
+        let content = Any::from_der(&signed_data_der)
+            .map_err(|e| CmsError::Der(format!("failed to re-parse SignedData as Any: {e}")))?;
+
+        let content_info = ContentInfo {
+            content_type: rfc5911::ID_SIGNED_DATA,
+            content,
+        };
+
+        content_info
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("failed to DER-encode ContentInfo: {e}")))
+    }
+
+    /// Build the signed attributes set.
+    ///
+    /// Always includes:
+    /// - `contentType` (id-data)
+    /// - `messageDigest` (the hash of the PDF byte ranges)
+    ///
+    /// PAdES additionally includes:
+    /// - `signingCertificateV2` (ESS)
+    ///
+    /// Traditional optionally includes:
+    /// - `signingTime`
+    fn build_signed_attributes(
+        &self,
+        data_hash: &[u8],
+        cert: &Certificate,
+    ) -> Result<SetOfVec<Attribute>, CmsError> {
+        let mut attrs: Vec<Attribute> = Vec::new();
+
+        // 1. Content-type attribute (always required)
+        attrs.push(build_content_type_attr()?);
+
+        // 2. Message-digest attribute (always required)
+        attrs.push(build_message_digest_attr(data_hash)?);
+
+        // 3. Profile-specific attributes
+        match self.profile {
+            CmsProfile::Pades => {
+                // PAdES requires signingCertificateV2
+                attrs.push(self.build_signing_certificate_v2_attr(cert)?);
+            }
+            CmsProfile::Traditional => {
+                // Traditional may include signingTime
+                if let Some(time) = &self.signing_time {
+                    attrs.push(build_signing_time_attr(time)?);
+                }
+            }
+        }
+
+        SetOfVec::try_from(attrs)
+            .map_err(|e| CmsError::Builder(format!("failed to build signed attributes set: {e}")))
+    }
+
+    /// Build the ESS `signingCertificateV2` attribute for PAdES.
+    ///
+    /// This attribute binds the signing certificate to the signature,
+    /// preventing certificate substitution attacks. It contains a hash
+    /// of the signer's certificate.
+    ///
+    /// ASN.1 structure (RFC 5035):
+    /// ```text
+    /// SigningCertificateV2 ::= SEQUENCE {
+    ///     certs SEQUENCE OF ESSCertIDv2,
+    ///     policies SEQUENCE OF PolicyInformation OPTIONAL
+    /// }
+    /// ESSCertIDv2 ::= SEQUENCE {
+    ///     hashAlgorithm AlgorithmIdentifier DEFAULT {algorithm id-sha256},
+    ///     certHash Hash,
+    ///     issuerSerial IssuerSerial OPTIONAL
+    /// }
+    /// ```
+    fn build_signing_certificate_v2_attr(&self, cert: &Certificate) -> Result<Attribute, CmsError> {
+        // Hash the entire DER-encoded signer certificate
+        let cert_der = cert
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("failed to DER-encode cert for hash: {e}")))?;
+        let cert_hash = self.signer.digest_algorithm().digest(&cert_der);
+
+        // Build the ESSCertIDv2 manually as DER.
+        // When the hash algorithm is SHA-256 (the default), the hashAlgorithm
+        // field can be omitted per RFC 5035. We always include it for clarity.
+        let hash_alg_der = self
+            .digest_algorithm_identifier()
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("failed to encode hash alg: {e}")))?;
+        let cert_hash_octet = OctetString::new(cert_hash)
+            .map_err(|e| CmsError::Der(format!("failed to create cert hash octet string: {e}")))?;
+        let cert_hash_der = cert_hash_octet
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("failed to encode cert hash: {e}")))?;
+
+        // Build IssuerSerial
+        let issuer_serial_der = build_issuer_serial_der(cert)?;
+
+        // ESSCertIDv2 ::= SEQUENCE { hashAlgorithm, certHash, issuerSerial }
+        let ess_cert_id_der = encode_sequence(&[&hash_alg_der, &cert_hash_der, &issuer_serial_der]);
+
+        // certs SEQUENCE OF ESSCertIDv2 (just one)
+        let certs_seq = encode_sequence(&[&ess_cert_id_der]);
+
+        // SigningCertificateV2 ::= SEQUENCE { certs }
+        // (policies omitted)
+        let signing_cert_v2 = encode_sequence(&[&certs_seq]);
+
+        // Build the Attribute
+        let value = AttributeValue::from_der(&signing_cert_v2).map_err(|e| {
+            CmsError::Der(format!(
+                "failed to parse signingCertificateV2 as AttributeValue: {e}"
+            ))
+        })?;
+        let mut values = SetOfVec::new();
+        values
+            .insert(value)
+            .map_err(|e| CmsError::Builder(format!("failed to insert attr value: {e}")))?;
+
+        Ok(Attribute {
+            oid: rfc5911::ID_AA_SIGNING_CERTIFICATE_V_2,
+            values,
+        })
+    }
+
+    /// DER-encode signed attributes for signing.
+    ///
+    /// Per RFC 5652 §5.4, when computing the signature over signed attributes,
+    /// the attributes are DER-encoded as a SET OF (implicit tag 0x31), NOT as
+    /// the IMPLICIT [0] tagged version used in the SignerInfo.
+    fn encode_attrs_for_signing(&self, attrs: &SetOfVec<Attribute>) -> Result<Vec<u8>, CmsError> {
+        // First encode the attributes as they would appear in SignerInfo
+        // (which uses IMPLICIT [0] CONSTRUCTED, tag 0xA0).
+        // Then replace the tag byte with SET OF (0x31).
+        let encoded = attrs
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("failed to DER-encode signed attributes: {e}")))?;
+
+        // The first byte is the SET OF tag (0x31) since SetOfVec encodes as SET OF.
+        // This is already correct for signing purposes.
+        // However, in the SignerInfo encoding, signed_attrs gets tagged as [0] IMPLICIT.
+        // The to_der() on SetOfVec produces the raw SET OF encoding, which is what we want.
+        Ok(encoded)
+    }
+
+    /// Get the AlgorithmIdentifier for the digest algorithm.
+    fn digest_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
+        let oid = match self.signer.digest_algorithm() {
+            DigestAlgorithm::Sha256 => rfc5912::ID_SHA_256,
+            DigestAlgorithm::Sha384 => rfc5912::ID_SHA_384,
+            DigestAlgorithm::Sha512 => rfc5912::ID_SHA_512,
+        };
+        AlgorithmIdentifierOwned {
+            oid,
+            parameters: None,
+        }
+    }
+
+    /// Get the AlgorithmIdentifier for the signature algorithm.
+    fn signature_algorithm_identifier(&self) -> Result<AlgorithmIdentifierOwned, CmsError> {
+        let (oid, parameters) = match (
+            self.signer.signature_algorithm(),
+            self.signer.digest_algorithm(),
+        ) {
+            (SignatureAlgorithm::RsaPkcs1v15, DigestAlgorithm::Sha256) => {
+                // RSA PKCS#1 v1.5 with SHA-256 requires NULL parameters
+                let null_any = Any::new(Tag::Null, Vec::new())
+                    .map_err(|e| CmsError::Der(format!("failed to create NULL Any: {e}")))?;
+                (rfc5912::SHA_256_WITH_RSA_ENCRYPTION, Some(null_any))
+            }
+            (SignatureAlgorithm::RsaPkcs1v15, DigestAlgorithm::Sha384) => {
+                let null_any = Any::new(Tag::Null, Vec::new())
+                    .map_err(|e| CmsError::Der(format!("failed to create NULL Any: {e}")))?;
+                (rfc5912::SHA_384_WITH_RSA_ENCRYPTION, Some(null_any))
+            }
+            (SignatureAlgorithm::RsaPkcs1v15, DigestAlgorithm::Sha512) => {
+                let null_any = Any::new(Tag::Null, Vec::new())
+                    .map_err(|e| CmsError::Der(format!("failed to create NULL Any: {e}")))?;
+                (rfc5912::SHA_512_WITH_RSA_ENCRYPTION, Some(null_any))
+            }
+            (SignatureAlgorithm::EcdsaP256, _) => (rfc5912::ECDSA_WITH_SHA_256, None),
+            (SignatureAlgorithm::EcdsaP384, _) => (rfc5912::ECDSA_WITH_SHA_384, None),
+            (alg, digest) => {
+                return Err(CmsError::UnsupportedAlgorithm(format!(
+                    "unsupported algorithm combination: {alg:?} with {digest:?}"
+                )));
+            }
+        };
+
+        Ok(AlgorithmIdentifierOwned { oid, parameters })
+    }
+
+    /// Build the certificate set to embed in the SignedData.
+    fn build_certificate_set(&self) -> Result<CertificateSet, CmsError> {
+        let mut cert_set = SetOfVec::new();
+
+        if self.embed_chain {
+            for cert_der in self.signer.certificate_chain_der() {
+                let cert = Certificate::from_der(cert_der).map_err(|e| {
+                    CmsError::Der(format!("failed to parse chain certificate: {e}"))
+                })?;
+                cert_set
+                    .insert(CertificateChoices::Certificate(cert))
+                    .map_err(|e| {
+                        CmsError::Builder(format!("failed to insert certificate into set: {e}"))
+                    })?;
+            }
+        } else {
+            let cert = Certificate::from_der(self.signer.certificate_der())
+                .map_err(|e| CmsError::Der(format!("failed to parse signer certificate: {e}")))?;
+            cert_set
+                .insert(CertificateChoices::Certificate(cert))
+                .map_err(|e| {
+                    CmsError::Builder(format!("failed to insert signer certificate into set: {e}"))
+                })?;
+        }
+
+        Ok(CertificateSet(cert_set))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions for building standard CMS signed attributes
+// ---------------------------------------------------------------------------
+
+/// Build the `contentType` signed attribute (always `id-data` for PDF signing).
+fn build_content_type_attr() -> Result<Attribute, CmsError> {
+    // The value is the OID id-data, encoded as an OID
+    let oid_bytes = rfc5911::ID_DATA
+        .to_der()
+        .map_err(|e| CmsError::Der(format!("failed to encode id-data OID: {e}")))?;
+    let value = AttributeValue::from_der(&oid_bytes)
+        .map_err(|e| CmsError::Der(format!("failed to parse content-type value: {e}")))?;
+    let mut values = SetOfVec::new();
+    values
+        .insert(value)
+        .map_err(|e| CmsError::Builder(format!("failed to insert content-type value: {e}")))?;
+
+    Ok(Attribute {
+        oid: rfc5911::ID_CONTENT_TYPE,
+        values,
+    })
+}
+
+/// Build the `messageDigest` signed attribute containing the hash of the PDF byte ranges.
+fn build_message_digest_attr(digest: &[u8]) -> Result<Attribute, CmsError> {
+    let octet_string = OctetString::new(digest.to_vec())
+        .map_err(|e| CmsError::Der(format!("failed to create digest octet string: {e}")))?;
+    let octet_der = octet_string
+        .to_der()
+        .map_err(|e| CmsError::Der(format!("failed to encode digest octet string: {e}")))?;
+    let value = AttributeValue::from_der(&octet_der)
+        .map_err(|e| CmsError::Der(format!("failed to parse message-digest value: {e}")))?;
+    let mut values = SetOfVec::new();
+    values
+        .insert(value)
+        .map_err(|e| CmsError::Builder(format!("failed to insert message-digest value: {e}")))?;
+
+    Ok(Attribute {
+        oid: rfc5911::ID_MESSAGE_DIGEST,
+        values,
+    })
+}
+
+/// Build the `signingTime` signed attribute.
+fn build_signing_time_attr(time: &chrono::NaiveDateTime) -> Result<Attribute, CmsError> {
+    // Per X.680: use UTCTime for years 1950-2049, GeneralizedTime otherwise
+    let year = time
+        .and_utc()
+        .format("%Y")
+        .to_string()
+        .parse::<u16>()
+        .unwrap_or(2025);
+
+    let dt = der::DateTime::new(
+        year,
+        time.format("%m").to_string().parse().unwrap_or(1),
+        time.format("%d").to_string().parse().unwrap_or(1),
+        time.format("%H").to_string().parse().unwrap_or(0),
+        time.format("%M").to_string().parse().unwrap_or(0),
+        time.format("%S").to_string().parse().unwrap_or(0),
+    )
+    .map_err(|e| CmsError::Der(format!("failed to create der::DateTime: {e}")))?;
+
+    let time_der = if year >= 1950 && year <= 2049 {
+        let utc_time = der::asn1::UtcTime::from_date_time(dt)
+            .map_err(|e| CmsError::Der(format!("failed to create UtcTime: {e}")))?;
+        utc_time
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("failed to encode UtcTime: {e}")))?
+    } else {
+        let gen_time = der::asn1::GeneralizedTime::from_date_time(dt);
+        gen_time
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("failed to encode GeneralizedTime: {e}")))?
+    };
+
+    let value = AttributeValue::from_der(&time_der)
+        .map_err(|e| CmsError::Der(format!("failed to parse signing-time value: {e}")))?;
+    let mut values = SetOfVec::new();
+    values
+        .insert(value)
+        .map_err(|e| CmsError::Builder(format!("failed to insert signing-time value: {e}")))?;
+
+    Ok(Attribute {
+        oid: rfc5911::ID_SIGNING_TIME,
+        values,
+    })
+}
+
+/// Build the DER encoding of IssuerSerial for ESS signingCertificateV2.
+///
+/// ```text
+/// IssuerSerial ::= SEQUENCE {
+///     issuer GeneralNames,
+///     serialNumber CertificateSerialNumber
+/// }
+/// GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
+/// GeneralName ::= CHOICE { directoryName [4] Name, ... }
+/// ```
+fn build_issuer_serial_der(cert: &Certificate) -> Result<Vec<u8>, CmsError> {
+    // Encode the issuer Name
+    let issuer_der = cert
+        .tbs_certificate
+        .issuer
+        .to_der()
+        .map_err(|e| CmsError::Der(format!("failed to encode issuer: {e}")))?;
+
+    // Wrap issuer as GeneralName directoryName [4] EXPLICIT
+    let general_name = encode_context_explicit(4, &issuer_der);
+    // Wrap in GeneralNames SEQUENCE
+    let general_names = encode_sequence(&[&general_name]);
+
+    // Encode serial number
+    let serial_der = cert
+        .tbs_certificate
+        .serial_number
+        .to_der()
+        .map_err(|e| CmsError::Der(format!("failed to encode serial number: {e}")))?;
+
+    // IssuerSerial SEQUENCE
+    Ok(encode_sequence(&[&general_names, &serial_der]))
+}
+
+// ---------------------------------------------------------------------------
+// Low-level DER encoding helpers
+// ---------------------------------------------------------------------------
+
+/// Encode a DER SEQUENCE wrapping the concatenated parts.
+fn encode_sequence(parts: &[&[u8]]) -> Vec<u8> {
+    let total_len: usize = parts.iter().map(|p| p.len()).sum();
+    let mut out = Vec::with_capacity(1 + length_bytes(total_len) + total_len);
+    out.push(0x30); // SEQUENCE tag
+    encode_length(&mut out, total_len);
+    for part in parts {
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+/// Encode a context-specific EXPLICIT tag wrapping content.
+fn encode_context_explicit(tag_num: u8, content: &[u8]) -> Vec<u8> {
+    let tag = 0xA0 | tag_num; // context-specific, constructed, explicit
+    let mut out = Vec::with_capacity(1 + length_bytes(content.len()) + content.len());
+    out.push(tag);
+    encode_length(&mut out, content.len());
+    out.extend_from_slice(content);
+    out
+}
+
+/// Encode DER definite-form length.
+fn encode_length(out: &mut Vec<u8>, len: usize) {
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len <= 0xFF {
+        out.push(0x81);
+        out.push(len as u8);
+    } else if len <= 0xFFFF {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    } else if len <= 0xFF_FFFF {
+        out.push(0x83);
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    } else {
+        out.push(0x84);
+        out.push((len >> 24) as u8);
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    }
+}
+
+/// How many bytes the DER length encoding takes.
+fn length_bytes(len: usize) -> usize {
+    if len < 0x80 {
+        1
+    } else if len <= 0xFF {
+        2
+    } else if len <= 0xFFFF {
+        3
+    } else if len <= 0xFF_FFFF {
+        4
+    } else {
+        5
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_content_type_attr() {
+        let attr = build_content_type_attr().unwrap();
+        assert_eq!(attr.oid, rfc5911::ID_CONTENT_TYPE);
+        assert_eq!(attr.values.len(), 1);
+    }
+
+    #[test]
+    fn test_message_digest_attr() {
+        let digest = vec![0xAA; 32]; // Fake SHA-256 digest
+        let attr = build_message_digest_attr(&digest).unwrap();
+        assert_eq!(attr.oid, rfc5911::ID_MESSAGE_DIGEST);
+        assert_eq!(attr.values.len(), 1);
+    }
+
+    #[test]
+    fn test_signing_time_attr() {
+        let time =
+            chrono::NaiveDateTime::parse_from_str("2025-06-15 12:00:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        let attr = build_signing_time_attr(&time).unwrap();
+        assert_eq!(attr.oid, rfc5911::ID_SIGNING_TIME);
+        assert_eq!(attr.values.len(), 1);
+    }
+
+    #[test]
+    fn test_encode_sequence() {
+        let inner = &[0x02, 0x01, 0x05]; // INTEGER 5
+        let seq = encode_sequence(&[inner]);
+        assert_eq!(seq, vec![0x30, 0x03, 0x02, 0x01, 0x05]);
+    }
+
+    #[test]
+    fn test_encode_length() {
+        // Short form
+        let mut buf = Vec::new();
+        encode_length(&mut buf, 0x7F);
+        assert_eq!(buf, vec![0x7F]);
+
+        // Long form, 1 byte
+        buf.clear();
+        encode_length(&mut buf, 0x80);
+        assert_eq!(buf, vec![0x81, 0x80]);
+
+        // Long form, 2 bytes
+        buf.clear();
+        encode_length(&mut buf, 0x0100);
+        assert_eq!(buf, vec![0x82, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn test_cms_builder_with_signer() {
+        // Load our test PKCS#12 and verify the builder can construct CMS
+        let p12_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/signer.p12");
+        let signer = crate::crypto::software::SoftwareSigner::from_pkcs12_file(p12_path, "test123")
+            .expect("failed to load test PKCS#12");
+
+        let builder = PdfCmsBuilder::new(&signer).profile(CmsProfile::Pades);
+
+        // Estimate size should be reasonable
+        let est = builder.estimate_size();
+        assert!(est > 1000, "estimate too small: {est}");
+        assert!(est < 100_000, "estimate too large: {est}");
+
+        // Build with a fake hash
+        let fake_hash = vec![0xBB; 32]; // SHA-256 sized
+        let cms_der = builder.build(&fake_hash).expect("CMS build failed");
+
+        // Verify we got a valid DER-encoded ContentInfo
+        assert!(!cms_der.is_empty());
+        let content_info =
+            ContentInfo::from_der(&cms_der).expect("failed to parse CMS ContentInfo");
+        assert_eq!(content_info.content_type, rfc5911::ID_SIGNED_DATA);
+
+        // Parse back the SignedData — use to_der() not value()
+        let sd_bytes = content_info
+            .content
+            .to_der()
+            .expect("failed to re-encode content");
+        let signed_data = SignedData::from_der(&sd_bytes).expect("failed to parse SignedData");
+        assert_eq!(signed_data.digest_algorithms.len(), 1);
+        assert!(signed_data.certificates.is_some());
+        assert_eq!(signed_data.signer_infos.0.len(), 1);
+
+        // Check the signer info
+        let si = &signed_data.signer_infos.0.as_slice()[0];
+        assert!(si.signed_attrs.is_some());
+        let attrs = si.signed_attrs.as_ref().unwrap();
+        // Should have: contentType, messageDigest, signingCertificateV2 (PAdES mode)
+        assert!(
+            attrs.len() >= 3,
+            "expected at least 3 signed attributes, got {}",
+            attrs.len()
+        );
+    }
+
+    #[test]
+    fn test_cms_builder_traditional_mode() {
+        let p12_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/signer.p12");
+        let signer = crate::crypto::software::SoftwareSigner::from_pkcs12_file(p12_path, "test123")
+            .expect("failed to load test PKCS#12");
+
+        let time =
+            chrono::NaiveDateTime::parse_from_str("2025-06-15 12:00:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        let builder = PdfCmsBuilder::new(&signer)
+            .profile(CmsProfile::Traditional)
+            .signing_time(time);
+
+        let fake_hash = vec![0xCC; 32];
+        let cms_der = builder.build(&fake_hash).expect("CMS build failed");
+
+        let content_info =
+            ContentInfo::from_der(&cms_der).expect("failed to parse CMS ContentInfo");
+        let sd_bytes = content_info
+            .content
+            .to_der()
+            .expect("failed to re-encode content");
+        let signed_data = SignedData::from_der(&sd_bytes).expect("failed to parse SignedData");
+
+        let si = &signed_data.signer_infos.0.as_slice()[0];
+        let attrs = si.signed_attrs.as_ref().unwrap();
+        // Traditional with signing_time: contentType, messageDigest, signingTime
+        assert!(
+            attrs.len() >= 3,
+            "expected at least 3 signed attributes, got {}",
+            attrs.len()
+        );
+    }
+}
