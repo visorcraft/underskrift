@@ -155,6 +155,44 @@ pub struct SignatureVerificationResult {
     /// `None` if no policy was configured on the verifier.
     pub policy_result: Option<PolicyResult>,
 
+    // ── Fields for ETSI TS 119 102-2 report generation ──────────────
+    /// Raw DER-encoded signer certificate bytes.
+    ///
+    /// Used by the ETSI report generator to create certificate Validation Objects
+    /// and proper `<SignerCertificate>` references. `None` if the signer
+    /// certificate could not be extracted from the CMS structure.
+    pub signer_cert_der: Option<Vec<u8>>,
+
+    /// Raw DER-encoded certificate chain (excluding the signer cert).
+    ///
+    /// Each entry is the DER encoding of one certificate in the chain.
+    /// Used by the ETSI report generator for chain certificate Validation Objects.
+    pub chain_certs_der: Vec<Vec<u8>>,
+
+    /// Raw CMS signature value bytes from the SignerInfo.
+    ///
+    /// Used by the ETSI report generator for proper `<SignatureIdentifier>`
+    /// with the actual signature value (not just a hash of the field name).
+    pub signature_value_bytes: Vec<u8>,
+
+    /// DTBSR (Data To Be Signed Representation) hash.
+    ///
+    /// Hash of the DER-encoded signed attributes (re-encoded as SET OF per
+    /// RFC 5652 §5.4). This is the data that was actually signed.
+    /// Used by the ETSI report generator for `<SignatureIdentifier>`.
+    pub dtbsr_hash: Vec<u8>,
+
+    /// Signature algorithm OID string (e.g. "1.2.840.113549.1.1.11" for SHA-256 with RSA).
+    ///
+    /// Used by the ETSI report generator for `<ds:SignatureMethod>`.
+    pub signature_algorithm_oid: Option<String>,
+
+    /// Raw DER bytes of the signature timestamp token.
+    ///
+    /// Used by the ETSI report generator to create timestamp Validation Objects.
+    /// `None` if no signature timestamp was embedded.
+    pub timestamp_token_der: Option<Vec<u8>>,
+
     /// Human-readable summary
     pub summary: String,
 }

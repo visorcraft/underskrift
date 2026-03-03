@@ -41,6 +41,7 @@
 
 pub mod algo;
 pub mod claims;
+pub mod embed;
 pub mod issuer;
 pub mod validator;
 
@@ -48,6 +49,11 @@ pub mod validator;
 pub use claims::{
     CertRefType, CertReferenceClaims, PolicyValidationClaims, SVTProfile, SigReferenceClaims,
     SignatureClaims, SignedDataClaims, SvtClaims, TimeValidationClaims, ValidationConclusion,
+};
+pub use embed::{
+    build_svt_timestamp_token, build_tst_info_with_svt, create_svt_sealed_pdf,
+    estimate_svt_token_size, extract_svt_jwt_from_token, is_svt_doc_timestamp, SvtSealOptions,
+    OID_SVT_EXTENSION, OID_SVT_TS_POLICY,
 };
 pub use issuer::{SvtIssuer, SvtModel};
 pub use validator::{SignatureSvtData, SvtValidationResult, SvtValidator};

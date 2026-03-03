@@ -42,6 +42,9 @@ pub mod types;
 
 pub use generator::EtsiReportGenerator;
 pub use types::{
-    MainIndication, POEType, ReportOptions, SubIndication, ValidationObjectType, NS_DS, NS_VR,
-    NS_XADES,
+    MainIndication, POEType, ReportOptions, RepresentationType, SignatureQuality, SubIndication,
+    ValidationObject, ValidationObjectCollector, ValidationObjectType, NS_DS, NS_VR, NS_XADES,
+    POLICY_BASIC, POLICY_PKIX, POLICY_SVT_PKIX, POLICY_SVT_TS_PKIX, POLICY_TS_PKIX, QUALITY_ADES,
+    QUALITY_ETSI, QUALITY_QC, QUALITY_QC_QSCD, REPORT_STATUS_MESSAGE,
+    SUBINDICATION_PARTIALLY_SIGNED,
 };

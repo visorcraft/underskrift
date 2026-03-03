@@ -294,6 +294,12 @@ mod tests {
             extended_by_non_safe_updates: Some(false),
             policy_result: None,
             summary: "test".into(),
+            signer_cert_der: None,
+            chain_certs_der: vec![],
+            signature_value_bytes: vec![],
+            dtbsr_hash: vec![],
+            signature_algorithm_oid: None,
+            timestamp_token_der: None,
         }
     }
 

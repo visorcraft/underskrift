@@ -296,6 +296,12 @@ pub enum SvtError {
 
     #[error("hash computation error: {0}")]
     HashError(String),
+
+    #[error("SVT embedding error: {0}")]
+    Embedding(String),
+
+    #[error("TSTInfo construction error: {0}")]
+    TstInfoBuild(String),
 }
 
 /// Errors from the `report` module — ETSI TS 119 102-2 validation reports.

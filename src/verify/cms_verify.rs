@@ -81,6 +81,16 @@ pub struct CmsVerifyResult {
     /// (the timestamp's messageImprint is the hash of these bytes).
     /// Needed for verifying the signature timestamp token.
     pub signature_value: Vec<u8>,
+    /// Hash of the DER-encoded signed attributes (Data To Be Signed Representation).
+    ///
+    /// This is the DTBSR — the hash that is actually signed by the signer's private key.
+    /// The signed attributes are re-encoded as a SET OF (tag 0x31) before hashing.
+    /// Needed for ETSI TS 119 102-2 `<SignatureIdentifier>`.
+    pub dtbsr_hash: Vec<u8>,
+    /// The signature algorithm OID from the CMS SignerInfo.
+    ///
+    /// Needed for ETSI TS 119 102-2 `<ds:SignatureMethod>` in reports.
+    pub signature_algorithm_oid: Option<String>,
     /// Human-readable issues
     pub issues: Vec<String>,
 }
@@ -177,6 +187,12 @@ pub fn verify_cms(cms_bytes: &[u8], data_hash: &[u8]) -> Result<CmsVerifyResult,
     // Step 8e: Extract raw signature value bytes (needed for timestamp verification)
     let signature_value = signer_info.signature.as_bytes().to_vec();
 
+    // Step 8f: Compute DTBSR hash (hash of DER-encoded signed attributes as SET OF)
+    let dtbsr_hash = compute_dtbsr_hash(signer_info, &digest_algorithm);
+
+    // Step 8g: Extract signature algorithm OID
+    let signature_algorithm_oid = Some(signer_info.signature_algorithm.oid.to_string());
+
     // Step 9: Verify the cryptographic signature
     let signature_valid = if let Some(ref cert) = signer_certificate {
         match verify_signer_info_signature(signer_info, cert) {
@@ -203,6 +219,8 @@ pub fn verify_cms(cms_bytes: &[u8], data_hash: &[u8]) -> Result<CmsVerifyResult,
         ess_cert_id_match,
         signature_timestamp_token,
         signature_value,
+        dtbsr_hash,
+        signature_algorithm_oid,
         issues,
     })
 }
@@ -1199,6 +1217,38 @@ fn oid_to_digest_algorithm(oid: &const_oid::ObjectIdentifier) -> Option<DigestAl
     } else {
         None
     }
+}
+
+/// Compute the DTBSR (Data To Be Signed Representation) hash.
+///
+/// The DTBSR is the hash of the DER-encoded signed attributes, re-encoded
+/// as a SET OF (tag 0x31) per RFC 5652 §5.4. This is the data that was
+/// actually signed by the signer's private key.
+///
+/// Returns the hash bytes, or an empty Vec if signed attributes are absent.
+fn compute_dtbsr_hash(signer_info: &SignerInfo, digest_alg: &Option<DigestAlgorithm>) -> Vec<u8> {
+    let signed_attrs = match signer_info.signed_attrs.as_ref() {
+        Some(attrs) => attrs,
+        None => return Vec::new(),
+    };
+
+    let attrs_der = match signed_attrs.to_der() {
+        Ok(der) => der,
+        Err(_) => return Vec::new(),
+    };
+
+    // Re-encode: the cms crate stores signed attrs with IMPLICIT [0] tag (0xA0).
+    // We need SET OF tag (0x31) per RFC 5652 §5.4.
+    let attrs_bytes = if !attrs_der.is_empty() && attrs_der[0] == 0xA0 {
+        let mut fixed = attrs_der;
+        fixed[0] = 0x31;
+        fixed
+    } else {
+        attrs_der
+    };
+
+    let alg = digest_alg.unwrap_or(DigestAlgorithm::Sha256);
+    alg.digest(&attrs_bytes)
 }
 
 #[cfg(test)]

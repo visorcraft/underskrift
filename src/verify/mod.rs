@@ -274,7 +274,7 @@ impl<'a> SignatureVerifier<'a> {
         all_issues.extend(integrity_result.issues);
 
         // --- Step B: CMS cryptographic verification ---
-        let (crypto_validity, digest_matches, signer_cert, embedded_certs, _cms_digest_alg, cms_signing_time, ess_cert_id_match, signature_timestamp_token, signature_value) =
+        let (crypto_validity, digest_matches, signer_cert, embedded_certs, _cms_digest_alg, cms_signing_time, ess_cert_id_match, signature_timestamp_token, signature_value, dtbsr_hash, signature_algorithm_oid) =
             match cms_verify::verify_cms(&sig.cms_bytes, &integrity_result.data_hash) {
                 Ok(cms_result) => {
                     all_issues.extend(cms_result.issues.clone());
@@ -324,6 +324,8 @@ impl<'a> SignatureVerifier<'a> {
                         cms_result.ess_cert_id_match,
                         cms_result.signature_timestamp_token,
                         cms_result.signature_value,
+                        cms_result.dtbsr_hash,
+                        cms_result.signature_algorithm_oid,
                     )
                 }
                 Err(e) => {
@@ -338,6 +340,8 @@ impl<'a> SignatureVerifier<'a> {
                         None,
                         None,
                         Vec::new(),
+                        Vec::new(),
+                        None,
                     )
                 }
             };
@@ -454,10 +458,26 @@ impl<'a> SignatureVerifier<'a> {
                 (CertValidity::ChainIncomplete, false, None, None, Vec::new())
             };
 
-        // --- Step D: Extract signer name ---
+        // --- Step D: Extract signer name and DER bytes for report ---
         let signer_name = signer_cert
             .as_ref()
             .map(|cert| format!("{}", cert.tbs_certificate.subject));
+
+        // DER-encode the signer cert and chain certs for ETSI report Validation Objects
+        let signer_cert_der = signer_cert.as_ref().and_then(|cert| {
+            der::Encode::to_der(cert).ok()
+        });
+        let chain_certs_der: Vec<Vec<u8>> = embedded_certs
+            .iter()
+            .filter(|c| {
+                // Exclude the signer cert itself from the chain certs
+                signer_cert.as_ref().map_or(true, |sc| {
+                    c.tbs_certificate.serial_number != sc.tbs_certificate.serial_number
+                        || c.tbs_certificate.issuer != sc.tbs_certificate.issuer
+                })
+            })
+            .filter_map(|c| der::Encode::to_der(c).ok())
+            .collect();
 
         // --- Step E: Check post-signature modifications (revision analysis) ---
         let (modifications_after_signing, covers_whole_doc_rev, extended_by_non_safe) =
@@ -529,6 +549,12 @@ impl<'a> SignatureVerifier<'a> {
             covers_whole_document_revision: covers_whole_doc_rev,
             extended_by_non_safe_updates: extended_by_non_safe,
             policy_result: None,
+            signer_cert_der,
+            chain_certs_der,
+            signature_value_bytes: signature_value,
+            dtbsr_hash,
+            signature_algorithm_oid,
+            timestamp_token_der: signature_timestamp_token.clone(),
             summary,
         };
 
@@ -746,6 +772,13 @@ impl<'a> SignatureVerifier<'a> {
             covers_whole_document_revision: covers_whole_doc_rev,
             extended_by_non_safe_updates: extended_by_non_safe,
             policy_result: None,
+            // DocTimestamp: no signer cert, chain, or signature value in the traditional sense
+            signer_cert_der: None,
+            chain_certs_der: Vec::new(),
+            signature_value_bytes: Vec::new(),
+            dtbsr_hash: Vec::new(),
+            signature_algorithm_oid: None,
+            timestamp_token_der: None,
             summary,
         };
 
