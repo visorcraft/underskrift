@@ -205,7 +205,7 @@ pub fn verify_cms(cms_bytes: &[u8], data_hash: &[u8]) -> Result<CmsVerifyResult,
 
     // Step 9: Verify the cryptographic signature
     let signature_valid = if let Some(ref cert) = signer_certificate {
-        match verify_signer_info_signature(signer_info, cert) {
+        match verify_signer_info_signature(signer_info, cert, cms_bytes) {
             Ok(()) => true,
             Err(e) => {
                 issues.push(format!("signature verification failed: {e}"));
@@ -629,7 +629,7 @@ pub fn verify_timestamp_token(
 
     // Step 5: Verify TSA CMS signature
     let tsa_signature_valid = if let Some(ref cert) = tsa_signer_cert {
-        match verify_signer_info_signature(tsa_signer_info, cert) {
+        match verify_signer_info_signature(tsa_signer_info, cert, token_der) {
             Ok(()) => true,
             Err(e) => {
                 issues.push(format!("TSA signature verification failed: {e}"));
@@ -809,7 +809,7 @@ pub fn verify_doc_timestamp(
     // the hash of the encapsulated TSTInfo DER, NOT the byte-range hash.
     // The CMS signature verification checks this internally.
     let tsa_signature_valid = if let Some(ref cert) = tsa_signer_cert {
-        match verify_signer_info_signature(tsa_signer_info, cert) {
+        match verify_signer_info_signature(tsa_signer_info, cert, token_der) {
             Ok(()) => true,
             Err(e) => {
                 issues.push(format!(
@@ -1108,34 +1108,38 @@ fn check_cms_algorithm_protection(
 ///
 /// Per RFC 5652 §5.4: The signature is computed over the DER-encoded
 /// signed attributes, re-encoded as a SET OF (tag 0x31).
+///
+/// `raw_cms_bytes` is the original DER-encoded CMS ContentInfo — we need it
+/// to extract the *exact* signed-attributes bytes as they appeared on the wire
+/// because `SetOfVec::to_der()` may re-sort elements, producing a different
+/// encoding from what the signer actually signed.
 fn verify_signer_info_signature(
     signer_info: &SignerInfo,
     signer_cert: &Certificate,
+    raw_cms_bytes: &[u8],
 ) -> Result<(), VerifyError> {
-    // Get the signed attributes DER
-    let signed_attrs = signer_info.signed_attrs.as_ref().ok_or_else(|| {
-        VerifyError::CmsVerification("no signed attributes in signer info".to_string())
-    })?;
+    // Try to extract the raw signed attributes bytes from the original DER.
+    // This preserves the original attribute ordering, which is critical because
+    // SetOfVec::to_der() may re-sort elements in DER canonical order, but the
+    // signer signed the attributes in their original order.
+    let attrs_bytes = extract_raw_signed_attrs(raw_cms_bytes).unwrap_or_else(|| {
+        // Fallback: re-encode from parsed structure (may fail for some signers)
+        let signed_attrs = signer_info.signed_attrs.as_ref().unwrap();
+        let attrs_der = signed_attrs.to_der().unwrap_or_default();
+        if !attrs_der.is_empty() && attrs_der[0] == 0xA0 {
+            let mut fixed = attrs_der;
+            fixed[0] = 0x31;
+            fixed
+        } else {
+            attrs_der
+        }
+    });
 
-    // Encode the signed attributes as SET OF for signature verification.
-    // The cms crate stores them internally as IMPLICIT [0], but to_der()
-    // on SetOfVec<Attribute> produces a SET OF (tag 0x31) encoding.
-    let attrs_der = signed_attrs.to_der().map_err(|e| {
-        VerifyError::CmsVerification(format!("failed to DER-encode signed attributes: {e}"))
-    })?;
-
-    // The signed_attrs from the cms crate's SignerInfo are stored with
-    // IMPLICIT [0] tag (0xA0). We need to re-encode them as SET OF (0x31)
-    // for signature verification per RFC 5652 §5.4.
-    let attrs_bytes = if !attrs_der.is_empty() && attrs_der[0] == 0xA0 {
-        // Replace the tag byte
-        let mut fixed = attrs_der.clone();
-        fixed[0] = 0x31;
-        fixed
-    } else {
-        // Already has SET OF tag or some other encoding
-        attrs_der
-    };
+    if attrs_bytes.is_empty() {
+        return Err(VerifyError::CmsVerification(
+            "no signed attributes found for signature verification".to_string(),
+        ));
+    }
 
     // Get signature algorithm OID
     let sig_alg_oid = &signer_info.signature_algorithm.oid;
@@ -1151,6 +1155,168 @@ fn verify_signer_info_signature(
 
     // Verify using the appropriate algorithm
     verify_cms_signature(sig_alg_oid, &attrs_bytes, signature_bytes, &spki_der)
+}
+
+/// Extract the raw signed attributes bytes from the original CMS DER,
+/// replacing the IMPLICIT [0] tag (0xA0) with SET OF (0x31).
+///
+/// This is necessary because the `cms` crate's `SetOfVec::to_der()` re-sorts
+/// attribute elements in DER canonical order, which may differ from the order
+/// the signer used when computing the signature.
+///
+/// We navigate the ASN.1 structure:
+///   ContentInfo → SignedData → SignerInfos → SignerInfo → signedAttrs [0]
+fn extract_raw_signed_attrs(cms_bytes: &[u8]) -> Option<Vec<u8>> {
+    // We need to navigate the DER manually to find the signed attrs.
+    // Structure:
+    //   ContentInfo ::= SEQUENCE { contentType OID, content [0] EXPLICIT ANY }
+    //   SignedData ::= SEQUENCE { version, digestAlgorithms, encapContentInfo,
+    //                             certificates [0] IMPLICIT OPTIONAL,
+    //                             crls [1] IMPLICIT OPTIONAL,
+    //                             signerInfos SET OF SignerInfo }
+    //   SignerInfo ::= SEQUENCE { version, sid, digestAlgorithm,
+    //                             signedAttrs [0] IMPLICIT SET OF Attribute, ... }
+
+    let reader = DerReader::new(cms_bytes);
+
+    // Parse ContentInfo SEQUENCE
+    let (_, content_info_body) = reader.read_sequence(0)?;
+
+    // Skip contentType OID
+    let ci_reader = DerReader::new(content_info_body);
+    let (oid_end, _) = ci_reader.read_tlv(0)?;
+
+    // Parse [0] EXPLICIT content
+    let (_, explicit_body) = ci_reader.read_tlv(oid_end)?;
+
+    // Parse SignedData SEQUENCE inside the explicit wrapper
+    let sd_reader = DerReader::new(explicit_body);
+    let (_, sd_body) = sd_reader.read_sequence(0)?;
+
+    // Navigate SignedData fields:
+    let field_reader = DerReader::new(sd_body);
+
+    // 1. version INTEGER
+    let (pos, _) = field_reader.read_tlv(0)?;
+    // 2. digestAlgorithms SET OF
+    let (pos, _) = field_reader.read_tlv(pos)?;
+    // 3. encapContentInfo SEQUENCE
+    let (pos, _) = field_reader.read_tlv(pos)?;
+
+    // 4. Next fields are optional: certificates [0], crls [1], then signerInfos SET OF
+    let mut pos = pos;
+    loop {
+        if pos >= sd_body.len() {
+            return None;
+        }
+        let tag = sd_body[pos];
+        if tag == 0x31 {
+            // Found signerInfos SET OF
+            let (_, signer_infos_body) = field_reader.read_tlv(pos)?;
+            // signer_infos_body contains the value of SET OF, which is one or more SignerInfo SEQUENCEs
+            // Parse first SignerInfo SEQUENCE
+            let si_reader = DerReader::new(signer_infos_body);
+            let (_, si_body) = si_reader.read_sequence(0)?;
+
+            // Navigate SignerInfo fields:
+            let si_field_reader = DerReader::new(si_body);
+            // 1. version INTEGER
+            let (si_pos, _) = si_field_reader.read_tlv(0)?;
+            // 2. sid CHOICE (IssuerAndSerialNumber SEQUENCE or [0] SubjectKeyIdentifier)
+            let (si_pos, _) = si_field_reader.read_tlv(si_pos)?;
+            // 3. digestAlgorithm AlgorithmIdentifier SEQUENCE
+            let (si_pos, _) = si_field_reader.read_tlv(si_pos)?;
+
+            // 4. signedAttrs [0] IMPLICIT — tag should be 0xA0
+            if si_pos < si_body.len() && si_body[si_pos] == 0xA0 {
+                // Extract the full TLV (tag + length + value)
+                let (_, raw_bytes) = si_field_reader.read_tlv_raw(si_pos)?;
+                // Replace 0xA0 with 0x31
+                let mut result = raw_bytes.to_vec();
+                result[0] = 0x31;
+                return Some(result);
+            }
+            return None;
+        } else {
+            // Skip this field (could be certificates [0] = 0xA0, crls [1] = 0xA1)
+            let (next_pos, _) = field_reader.read_tlv(pos)?;
+            pos = next_pos;
+        }
+    }
+}
+
+/// Minimal DER reader for navigating ASN.1 structures without re-encoding.
+struct DerReader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> DerReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    /// Read a TLV at the given offset, returning (end_offset, value_slice).
+    fn read_tlv(&self, offset: usize) -> Option<(usize, &'a [u8])> {
+        if offset >= self.data.len() {
+            return None;
+        }
+        let _tag = self.data[offset];
+        let (len, header_len) = self.read_length(offset + 1)?;
+        let value_start = offset + 1 + header_len;
+        let value_end = value_start + len;
+        if value_end > self.data.len() {
+            return None;
+        }
+        Some((value_end, &self.data[value_start..value_end]))
+    }
+
+    /// Read a TLV at the given offset, returning (end_offset, full_tlv_slice).
+    fn read_tlv_raw(&self, offset: usize) -> Option<(usize, &'a [u8])> {
+        if offset >= self.data.len() {
+            return None;
+        }
+        let _tag = self.data[offset];
+        let (len, header_len) = self.read_length(offset + 1)?;
+        let value_end = offset + 1 + header_len + len;
+        if value_end > self.data.len() {
+            return None;
+        }
+        Some((value_end, &self.data[offset..value_end]))
+    }
+
+    /// Read a SEQUENCE, returning (end_offset, sequence_body).
+    fn read_sequence(&self, offset: usize) -> Option<(usize, &'a [u8])> {
+        if offset >= self.data.len() || self.data[offset] != 0x30 {
+            return None;
+        }
+        self.read_tlv(offset)
+    }
+
+    /// Read a DER length field, returning (length_value, num_bytes_consumed).
+    fn read_length(&self, offset: usize) -> Option<(usize, usize)> {
+        if offset >= self.data.len() {
+            return None;
+        }
+        let first = self.data[offset] as usize;
+        if first < 0x80 {
+            // Short form
+            Some((first, 1))
+        } else if first == 0x80 {
+            // Indefinite length — not valid DER
+            None
+        } else {
+            // Long form: first byte = 0x80 | num_length_bytes
+            let num_bytes = first & 0x7F;
+            if num_bytes > 4 || offset + 1 + num_bytes > self.data.len() {
+                return None;
+            }
+            let mut len = 0usize;
+            for i in 0..num_bytes {
+                len = (len << 8) | (self.data[offset + 1 + i] as usize);
+            }
+            Some((len, 1 + num_bytes))
+        }
+    }
 }
 
 /// Verify a CMS signature given the algorithm OID, data, signature, and public key.
@@ -1171,15 +1337,24 @@ fn verify_cms_signature(
         verify_rsa_cms::<sha2::Sha512>(data, signature, spki_der)
     } else if *sig_alg_oid == OID_RSASSA_PSS {
         // RSA-PSS: try SHA-256 first (most common), then SHA-384, SHA-512.
-        // In a production setting, the AlgorithmIdentifier parameters would
-        // specify the hash algorithm; for now we attempt each.
         verify_rsa_pss_cms::<sha2::Sha256>(data, signature, spki_der)
             .or_else(|_| verify_rsa_pss_cms::<sha2::Sha384>(data, signature, spki_der))
             .or_else(|_| verify_rsa_pss_cms::<sha2::Sha512>(data, signature, spki_der))
     } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_256 {
+        // ECDSA-SHA256: try P-256 first, then P-384, then P-521
+        // P-521 with SHA-256 is unusual but occurs with self-signed certs
         verify_ecdsa_p256_cms(data, signature, spki_der)
+            .or_else(|_| verify_ecdsa_p384_cms(data, signature, spki_der))
+            .or_else(|_| verify_ecdsa_p521_sha256_cms(data, signature, spki_der))
     } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_384 {
+        // ECDSA-SHA384: try P-384 first, then P-256, then P-521
         verify_ecdsa_p384_cms(data, signature, spki_der)
+            .or_else(|_| verify_ecdsa_p256_cms(data, signature, spki_der))
+            .or_else(|_| verify_ecdsa_p521_sha384_cms(data, signature, spki_der))
+    } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_512 {
+        // ECDSA-SHA512: try P-521 first, then P-384
+        verify_ecdsa_p521_cms(data, signature, spki_der)
+            .or_else(|_| verify_ecdsa_p384_cms(data, signature, spki_der))
     } else if *sig_alg_oid == OID_ED25519 {
         verify_ed25519_cms(data, signature, spki_der)
     } else {
@@ -1246,6 +1421,80 @@ fn verify_ecdsa_p384_cms(
 
     vk.verify(data, &sig)
         .map_err(|e| VerifyError::CmsVerification(format!("ECDSA P-384 invalid: {e}")))
+}
+
+fn verify_ecdsa_p521_cms(
+    data: &[u8],
+    signature: &[u8],
+    spki_der: &[u8],
+) -> Result<(), VerifyError> {
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+    use spki::SubjectPublicKeyInfoRef;
+
+    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| VerifyError::CmsVerification(format!("SPKI decode failed: {e}")))?;
+    let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
+        .map_err(|e| VerifyError::CmsVerification(format!("P-521 key decode failed: {e}")))?;
+    let sig = ecdsa::Signature::<p521::NistP521>::from_der(signature)
+        .map_err(|e| VerifyError::CmsVerification(format!("P-521 signature decode failed: {e}")))?;
+
+    // P-521 doesn't implement DigestPrimitive, so we prehash with SHA-512
+    let hash = sha2::Sha512::digest(data);
+    vk.verify_prehash(&hash, &sig)
+        .map_err(|e| VerifyError::CmsVerification(format!("ECDSA P-521 invalid: {e}")))
+}
+
+/// Verify an ECDSA P-521 CMS signature where the algorithm specified SHA-256.
+///
+/// Note: The `ecdsa` crate's `bits2field` requires the hash to be at least
+/// half the field size (33 bytes for P-521). Since SHA-256 produces 32 bytes,
+/// we left-pad with zeros to field size (66 bytes) to satisfy this constraint.
+fn verify_ecdsa_p521_sha256_cms(
+    data: &[u8],
+    signature: &[u8],
+    spki_der: &[u8],
+) -> Result<(), VerifyError> {
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+    use spki::SubjectPublicKeyInfoRef;
+
+    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| VerifyError::CmsVerification(format!("SPKI decode failed: {e}")))?;
+    let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
+        .map_err(|e| VerifyError::CmsVerification(format!("P-521 key decode failed: {e}")))?;
+    let sig = ecdsa::Signature::<p521::NistP521>::from_der(signature)
+        .map_err(|e| VerifyError::CmsVerification(format!("P-521 signature decode failed: {e}")))?;
+
+    let hash = sha2::Sha256::digest(data);
+    // SHA-256 produces 32 bytes, but ecdsa crate's bits2field requires >= 33 bytes
+    // (half of P-521's 66-byte field size). Left-pad to 66 bytes (field size).
+    let mut padded = vec![0u8; 66];
+    padded[66 - 32..].copy_from_slice(&hash);
+    vk.verify_prehash(&padded, &sig)
+        .map_err(|e| VerifyError::CmsVerification(format!("ECDSA P-521/SHA-256 invalid: {e}")))
+}
+
+/// Verify an ECDSA P-521 CMS signature where the algorithm specified SHA-384.
+fn verify_ecdsa_p521_sha384_cms(
+    data: &[u8],
+    signature: &[u8],
+    spki_der: &[u8],
+) -> Result<(), VerifyError> {
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+    use spki::SubjectPublicKeyInfoRef;
+
+    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| VerifyError::CmsVerification(format!("SPKI decode failed: {e}")))?;
+    let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
+        .map_err(|e| VerifyError::CmsVerification(format!("P-521 key decode failed: {e}")))?;
+    let sig = ecdsa::Signature::<p521::NistP521>::from_der(signature)
+        .map_err(|e| VerifyError::CmsVerification(format!("P-521 signature decode failed: {e}")))?;
+
+    let hash = sha2::Sha384::digest(data);
+    vk.verify_prehash(&hash, &sig)
+        .map_err(|e| VerifyError::CmsVerification(format!("ECDSA P-521/SHA-384 invalid: {e}")))
 }
 
 fn verify_rsa_pss_cms<

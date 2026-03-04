@@ -40,6 +40,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
+p521 = { version = "0.13", features = ["ecdsa"] }
 ed25519-dalek = { version = "2", features = ["pem"] }
 signature = "2"
 

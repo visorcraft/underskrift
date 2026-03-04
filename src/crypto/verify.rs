@@ -8,6 +8,7 @@
 //! - RSA-PSS (RSASSA-PSS) with SHA-256, SHA-384, SHA-512
 //! - ECDSA P-256 with SHA-256
 //! - ECDSA P-384 with SHA-384
+//! - ECDSA P-521 with SHA-512
 //! - Ed25519
 
 use crate::crypto::algorithm::{OID_ED25519, OID_RSASSA_PSS};
@@ -29,6 +30,7 @@ use crate::error::TrustError;
 /// | `1.2.840.113549.1.1.10` | RSASSA-PSS (tries SHA-256/384/512) |
 /// | `1.2.840.10045.4.3.2`   | ECDSA with SHA-256 |
 /// | `1.2.840.10045.4.3.3`   | ECDSA with SHA-384 |
+/// | `1.2.840.10045.4.3.4`   | ECDSA with SHA-512 |
 /// | `1.3.101.112`           | Ed25519 |
 pub fn verify_signature_by_oid(
     tbs_bytes: &[u8],
@@ -55,9 +57,20 @@ pub fn verify_signature_by_oid(
                 verify_rsa_pss_signature::<sha2::Sha512>(tbs_bytes, signature_bytes, spki_der)
             })
     } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_256 {
+        // ECDSA-SHA256: try P-256 first, then P-384, then P-521
+        // P-521 with SHA-256 is unusual but occurs with self-signed certs
         verify_ecdsa_p256_signature(tbs_bytes, signature_bytes, spki_der)
+            .or_else(|_| verify_ecdsa_p384_signature(tbs_bytes, signature_bytes, spki_der))
+            .or_else(|_| verify_ecdsa_p521_sha256_signature(tbs_bytes, signature_bytes, spki_der))
     } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_384 {
+        // ECDSA-SHA384: try P-384 first, then P-256, then P-521
         verify_ecdsa_p384_signature(tbs_bytes, signature_bytes, spki_der)
+            .or_else(|_| verify_ecdsa_p256_signature(tbs_bytes, signature_bytes, spki_der))
+            .or_else(|_| verify_ecdsa_p521_sha384_signature(tbs_bytes, signature_bytes, spki_der))
+    } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_512 {
+        // ECDSA-SHA512: try P-521 first, then P-384
+        verify_ecdsa_p521_signature(tbs_bytes, signature_bytes, spki_der)
+            .or_else(|_| verify_ecdsa_p384_signature(tbs_bytes, signature_bytes, spki_der))
     } else if *sig_alg_oid == OID_ED25519 {
         verify_ed25519_signature(tbs_bytes, signature_bytes, spki_der)
     } else {
@@ -181,6 +194,85 @@ pub fn verify_ecdsa_p384_signature(
 
     vk.verify(tbs, &signature)
         .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-384 invalid: {e}")))
+}
+
+/// Verify an ECDSA P-521 (SHA-512) signature.
+pub fn verify_ecdsa_p521_signature(
+    tbs: &[u8],
+    sig: &[u8],
+    spki_der: &[u8],
+) -> Result<(), TrustError> {
+    use der::Decode;
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+    use spki::SubjectPublicKeyInfoRef;
+
+    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
+    let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-521 key decode failed: {e}")))?;
+    let signature = ecdsa::Signature::<p521::NistP521>::from_der(sig)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-521 sig decode failed: {e}")))?;
+
+    // P-521 doesn't implement DigestPrimitive, so we prehash with SHA-512
+    let hash = sha2::Sha512::digest(tbs);
+    vk.verify_prehash(&hash, &signature)
+        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-521 invalid: {e}")))
+}
+
+/// Verify an ECDSA P-521 signature where the *signing algorithm* specified SHA-256
+/// (e.g., a self-signed cert with `ecdsa-with-SHA256` but a P-521 key).
+///
+/// Note: The `ecdsa` crate's `bits2field` requires the hash to be at least
+/// half the field size (33 bytes for P-521). Since SHA-256 produces 32 bytes,
+/// we left-pad with a zero byte to satisfy this constraint.
+pub fn verify_ecdsa_p521_sha256_signature(
+    tbs: &[u8],
+    sig: &[u8],
+    spki_der: &[u8],
+) -> Result<(), TrustError> {
+    use der::Decode;
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+    use spki::SubjectPublicKeyInfoRef;
+
+    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
+    let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-521 key decode failed: {e}")))?;
+    let signature = ecdsa::Signature::<p521::NistP521>::from_der(sig)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-521 sig decode failed: {e}")))?;
+
+    let hash = sha2::Sha256::digest(tbs);
+    // SHA-256 produces 32 bytes, but ecdsa crate's bits2field requires >= 33 bytes
+    // (half of P-521's 66-byte field size). Left-pad to 66 bytes (field size).
+    let mut padded = vec![0u8; 66];
+    padded[66 - 32..].copy_from_slice(&hash);
+    vk.verify_prehash(&padded, &signature)
+        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-521/SHA-256 invalid: {e}")))
+}
+
+/// Verify an ECDSA P-521 signature where the *signing algorithm* specified SHA-384.
+pub fn verify_ecdsa_p521_sha384_signature(
+    tbs: &[u8],
+    sig: &[u8],
+    spki_der: &[u8],
+) -> Result<(), TrustError> {
+    use der::Decode;
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+    use spki::SubjectPublicKeyInfoRef;
+
+    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
+    let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-521 key decode failed: {e}")))?;
+    let signature = ecdsa::Signature::<p521::NistP521>::from_der(sig)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-521 sig decode failed: {e}")))?;
+
+    let hash = sha2::Sha384::digest(tbs);
+    vk.verify_prehash(&hash, &signature)
+        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-521/SHA-384 invalid: {e}")))
 }
 
 /// Verify an Ed25519 signature.

@@ -486,3 +486,101 @@ fn test_verify_doc_timestamp_without_tsa_trust_store() {
         sig.summary
     );
 }
+
+// ── Real-world signed PDF: kushal_about-signed.pdf ────────────────────────
+
+/// Test verification of a real-world PDF signed by eduSign (SUNET).
+/// This PDF has:
+/// - Signature1: adbe.pkcs7.detached with RSA signer cert (ECDSA CA chain)
+/// - Signature2: ETSI.RFC3161 document timestamp
+#[test]
+fn test_verify_kushal_signed_pdf() {
+    let pdf_path = format!("{}/kushal_about-signed.pdf", FIXTURES);
+    let pdf_data = std::fs::read(&pdf_path).expect("failed to read kushal PDF");
+
+    // Load sig trust store from pdfviewer trust directory
+    let trust_base = format!("{}/../../../pdfviewer/trust", FIXTURES);
+    let sig_store =
+        TrustStore::from_pem_directory(format!("{}/sig", trust_base))
+            .expect("failed to load sig trust dir");
+    let tsa_store =
+        TrustStore::from_pem_directory(format!("{}/tsa", trust_base))
+            .expect("failed to load tsa trust dir");
+
+    let trust_stores = TrustStoreSet::new()
+        .with_sig_store(sig_store)
+        .with_tsa_store(tsa_store);
+
+    let verifier = SignatureVerifier::new(&trust_stores);
+    let report = verifier.verify_pdf(&pdf_data).expect("verification failed");
+
+    assert_eq!(report.signatures.len(), 2, "should have 2 signatures");
+
+    let sig0 = &report.signatures[0];
+    eprintln!("Sig0 field: {}", sig0.field_name);
+    eprintln!("Sig0 status: {:?}", sig0.status);
+    eprintln!("Sig0 integrity_ok: {}", sig0.integrity_ok);
+    eprintln!("Sig0 digest_matches: {}", sig0.digest_matches);
+    eprintln!("Sig0 crypto_validity: {:?}", sig0.cryptographic_validity);
+    eprintln!("Sig0 chain_trusted: {}", sig0.chain_trusted);
+    eprintln!("Sig0 covers_whole_document: {}", sig0.covers_whole_document);
+    eprintln!(
+        "Sig0 covers_whole_document_revision: {:?}",
+        sig0.covers_whole_document_revision
+    );
+    eprintln!("Sig0 summary: {}", sig0.summary);
+
+    let sig1 = &report.signatures[1];
+    eprintln!("\nSig1 field: {}", sig1.field_name);
+    eprintln!("Sig1 status: {:?}", sig1.status);
+    eprintln!("Sig1 integrity_ok: {}", sig1.integrity_ok);
+    eprintln!("Sig1 digest_matches: {}", sig1.digest_matches);
+    eprintln!("Sig1 crypto_validity: {:?}", sig1.cryptographic_validity);
+    eprintln!("Sig1 chain_trusted: {}", sig1.chain_trusted);
+    eprintln!("Sig1 summary: {}", sig1.summary);
+
+    // Sig0: adbe.pkcs7.detached — RSA signature is genuinely invalid
+    // (confirmed by openssl), but digest matches and chain is trusted.
+    assert_eq!(sig0.field_name, "Signature1");
+    assert_eq!(
+        sig0.status,
+        SignatureStatus::Invalid,
+        "Sig0 should be Invalid (RSA signature is genuinely bad)"
+    );
+    assert!(sig0.integrity_ok, "Sig0 ByteRange integrity should be OK");
+    assert!(sig0.digest_matches, "Sig0 digest should match");
+    assert!(sig0.chain_trusted, "Sig0 chain should be trusted");
+    assert!(
+        !sig0.covers_whole_document,
+        "Sig0 should not cover whole file (timestamp appended after)"
+    );
+    assert_eq!(
+        sig0.covers_whole_document_revision,
+        Some(true),
+        "Sig0 should cover its own revision"
+    );
+    match &sig0.cryptographic_validity {
+        underskrift::verify::report::CryptoValidity::Invalid(msg) => {
+            assert!(
+                msg.contains("RSA signature invalid"),
+                "Sig0 crypto error should mention RSA: {msg}"
+            );
+        }
+        other => panic!("Sig0 crypto_validity should be Invalid, got: {other:?}"),
+    }
+
+    // Sig1: ETSI.RFC3161 document timestamp — should be fully Valid
+    assert_eq!(sig1.field_name, "Signature2");
+    assert_eq!(
+        sig1.status,
+        SignatureStatus::Valid,
+        "Sig1 (doc timestamp) should be Valid"
+    );
+    assert!(sig1.integrity_ok, "Sig1 ByteRange integrity should be OK");
+    assert!(sig1.digest_matches, "Sig1 digest should match");
+    assert!(sig1.chain_trusted, "Sig1 chain should be trusted");
+    match &sig1.cryptographic_validity {
+        underskrift::verify::report::CryptoValidity::Valid => {}
+        other => panic!("Sig1 crypto_validity should be Valid, got: {other:?}"),
+    }
+}

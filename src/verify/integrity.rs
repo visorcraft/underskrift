@@ -92,13 +92,15 @@ pub fn verify_byte_range(
 
     // Check 5: Second range should extend to EOF for complete coverage
     let covers_whole_file = end2 == file_len;
-    if !covers_whole_file {
-        issues.push(format!(
-            "ByteRange does not cover to EOF: ends at {end2}, file is {file_len} bytes"
-        ));
-    }
+
+    // Note: Not covering to EOF is expected for non-final signatures in
+    // multi-signature PDFs (e.g., when a document timestamp was added after
+    // the signature). This is NOT an integrity error — it's informational.
+    // The `covers_whole_file` field captures this separately.
 
     // Compute the hash of the byte-range-selected data
+    // `valid` reflects structural integrity only (checks 1-4), NOT whether
+    // the signature covers to EOF.
     let valid = issues.is_empty();
     let data_hash = if end1 <= file_len && end2 <= file_len && offset2 <= file_len {
         compute_byte_range_hash(pdf_data, byte_range, digest_alg)
@@ -184,10 +186,13 @@ mod tests {
 
         let result = verify_byte_range(&pdf_data, &byte_range, DigestAlgorithm::Sha256);
         assert!(!result.covers_whole_file);
-        assert!(result
-            .issues
-            .iter()
-            .any(|i| i.contains("does not cover to EOF")));
+        // Not covering EOF is informational, not an integrity error —
+        // it's expected for non-final signatures in multi-signature PDFs.
+        // The `covers_whole_file` field captures this; no issue string is emitted.
+        assert!(
+            result.valid,
+            "ByteRange not covering EOF should still be structurally valid"
+        );
     }
 
     #[test]
