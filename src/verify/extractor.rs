@@ -203,7 +203,15 @@ fn extract_byte_range_values(sig_dict: &lopdf::Dictionary) -> Option<[usize; 4]>
     }
     let values: Vec<usize> = arr
         .iter()
-        .filter_map(|obj| obj.as_i64().ok().map(|v| v as usize))
+        .filter_map(|obj| {
+            obj.as_i64().ok().and_then(|v| {
+                if v < 0 {
+                    None // Reject negative ByteRange values
+                } else {
+                    Some(v as usize)
+                }
+            })
+        })
         .collect();
     if values.len() == 4 {
         Some([values[0], values[1], values[2], values[3]])
