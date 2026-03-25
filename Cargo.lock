@@ -2364,6 +2364,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tsp-ltv"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "072e18abb3fbc096b1c607cbb3eefffda07430f226c1a4cf8a9411185bc004d9"
+dependencies = [
+ "base64",
+ "chrono",
+ "cms",
+ "const-oid",
+ "der",
+ "digest",
+ "ecdsa",
+ "ed25519-dalek",
+ "hex",
+ "log",
+ "md-5",
+ "p256",
+ "p384",
+ "p521",
+ "pem-rfc7468",
+ "reqwest",
+ "rsa",
+ "sha1",
+ "sha2",
+ "sha3",
+ "signature",
+ "spki",
+ "thiserror",
+ "tokio",
+ "x509-cert",
+]
+
+[[package]]
 name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2411,6 +2444,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tsp-ltv",
  "ttf-parser",
  "uppsala",
  "x509-cert",

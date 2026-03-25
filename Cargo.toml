@@ -26,6 +26,9 @@ report   = ["verify", "dep:uppsala"]                      # ETSI TS 119 102-2 va
 inspect  = ["dep:serde_json"]                              # PDF object inspection and metadata extraction
 
 [dependencies]
+# Shared TSP/LTV infrastructure
+tsp-ltv = "0.1"
+
 # PDF parsing and manipulation
 lopdf = "0.39"
 
