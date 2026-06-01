@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+Cargo.lock
 
 # Private keys and PKCS#12 bundles — NEVER commit these
 tests/fixtures/ca_key.pem

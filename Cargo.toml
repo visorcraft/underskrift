@@ -1,6 +1,6 @@
 [package]
 name = "underskrift"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.75"
 description = "PDF digital signing library — PAdES B-B through B-LTA, PKCS#7, visible/invisible signatures, LTV, and verification"
@@ -27,7 +27,7 @@ inspect  = ["dep:serde_json"]                              # PDF object inspecti
 
 [dependencies]
 # Shared TSP/LTV infrastructure
-tsp-ltv = "0.1"
+tsp-ltv = "0.2"
 
 # PDF parsing and manipulation
 lopdf = "0.39"
@@ -84,7 +84,7 @@ subsetter = { version = "0.2", optional = true }
 ttf-parser = { version = "0.25", optional = true }
 
 # XML parsing — optional (SACI + ETSI reports)
-uppsala = { version = "0.3", optional = true }
+uppsala = { version = "0.4", optional = true }
 
 # JWT / SVT — optional
 josekit = { version = "0.10", optional = true }
