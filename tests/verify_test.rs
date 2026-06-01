@@ -512,8 +512,8 @@ fn test_verify_kushal_signed_pdf() {
     let pdf_path = format!("{}/kushal_about-signed.pdf", FIXTURES);
     let pdf_data = std::fs::read(&pdf_path).expect("failed to read kushal PDF");
 
-    // Load sig trust store from pdfviewer trust directory
-    let trust_base = format!("{}/../../../pdfviewer/trust", FIXTURES);
+    // Load sig trust store from the vendored real-world trust directory
+    let trust_base = format!("{}/realworld/trust", FIXTURES);
     let sig_store = TrustStore::from_pem_directory(format!("{}/sig", trust_base))
         .expect("failed to load sig trust dir");
     let tsa_store = TrustStore::from_pem_directory(format!("{}/tsa", trust_base))
@@ -603,11 +603,11 @@ fn test_verify_kushal_signed_pdf() {
 /// This tests Bug 5: chain verification should not report P-521 errors for P-256 chains.
 #[test]
 fn test_verify_hello_signed_prod_pdf() {
-    let pdf_path = format!("{}/../../../hello-signed-prod.pdf", FIXTURES);
+    let pdf_path = format!("{}/realworld/hello-signed-prod.pdf", FIXTURES);
     let pdf_data = std::fs::read(&pdf_path).expect("failed to read hello-signed-prod.pdf");
 
     // Load just the root CA — minimal trust store
-    let trust_base = format!("{}/../../../pdfviewer/trust", FIXTURES);
+    let trust_base = format!("{}/realworld/trust", FIXTURES);
     let sig_store = TrustStore::from_pem_directory(format!("{}/sig", trust_base))
         .expect("failed to load sig trust dir");
     let tsa_store = TrustStore::from_pem_directory(format!("{}/tsa", trust_base))
