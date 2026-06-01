@@ -33,6 +33,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Generate test fixtures
+        working-directory: tests/fixtures
+        run: bash ../../gen-test-fixtures.sh
+
       - name: Build
         run: cargo build --all-features
 
