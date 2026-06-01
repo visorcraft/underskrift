@@ -9,6 +9,13 @@ repository = "https://github.com/kushaldas/underskrift"
 keywords = ["pdf", "signing", "pades", "pkcs7", "digital-signature"]
 categories = ["cryptography", "parser-implementations"]
 
+# Keep test-only and dev-only assets out of the published crate.
+exclude = [
+    "tests/fixtures/realworld",
+    "2025_signed.pdf",
+    ".serena",
+]
+
 [features]
 default = ["tsp", "ltv", "visual", "verify", "blocking", "saci", "svt", "report", "inspect"]
 
