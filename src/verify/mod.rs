@@ -179,17 +179,30 @@ impl<'a> SignatureVerifier<'a> {
             return Err(VerifyError::NoSignatures.into());
         }
 
-        // Step 1b: Run revision analysis (best-effort; if it fails, fall back)
+        // Step 1b: Run revision analysis (best-effort; if it fails, fall back
+        // to simple byte-range checks, but record a warning)
         let revision_analysis =
             RevisionAnalysis::analyze(pdf_data, &DefaultSafeObjectClassifier).ok();
+        let revision_analysis_failed = revision_analysis.is_none();
 
         let mut results = Vec::with_capacity(extracted.len());
         let num_sigs = extracted.len();
 
         for (idx, sig) in extracted.iter().enumerate() {
             let is_last = idx == num_sigs - 1;
-            let result =
+            let mut result =
                 self.verify_single_signature(pdf_data, sig, is_last, revision_analysis.as_ref());
+
+            // If revision analysis failed, record a warning in each signature's
+            // integrity_issues so consumers know that shadow-attack and
+            // incremental-save-attack detection was not available.
+            if revision_analysis_failed {
+                result.integrity_issues.push(
+                    "revision analysis failed; shadow attack detection was not available"
+                        .to_string(),
+                );
+            }
+
             results.push(result);
         }
 

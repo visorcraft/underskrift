@@ -3,12 +3,9 @@
 //! Embeds revocation information (OCSP responses, CRLs) and certificates
 //! into the PDF's Document Security Store (DSS) for offline validation.
 //!
-//! # Architecture
-//!
-//! - [`DssBuilder`] — Collects and builds the DSS dictionary
-//! - [`OcspClient`] — Fetches OCSP responses from responders
-//! - [`CrlClient`] — Fetches and caches CRLs from distribution points
-//! - [`ChainBuilder`] — Discovers intermediate certs via AIA extensions
+//! Most LTV infrastructure (OCSP, CRL, chain building, trust stores) lives
+//! in the shared [`tsp_ltv`] crate. This module adds the PDF-specific DSS
+//! dictionary builder on top.
 //!
 //! # PAdES Levels
 //!
@@ -19,30 +16,36 @@
 //! | B-LT  | DSS with certs, OCSP, CRLs |
 //! | B-LTA | DSS + document timestamp |
 
-pub mod chain;
-pub mod crl;
+// PDF-specific module (stays in underskrift)
 pub mod dss;
-pub mod ocsp;
-pub mod revocation;
-pub mod status;
-pub mod x509_ext;
 
-// Re-exports
-pub use chain::ChainBuilder;
-pub use crl::CrlClient;
-pub use dss::{DssBuilder, VriEntry, compute_vri_key};
-pub use ocsp::{
-    OcspClient, AiaAccessMethod, extract_aia_urls,
+// Re-export everything from tsp-ltv so `crate::ltv::*` still works
+pub use tsp_ltv::ltv::chain;
+pub use tsp_ltv::ltv::crl;
+pub use tsp_ltv::ltv::ocsp;
+pub use tsp_ltv::ltv::revocation;
+pub use tsp_ltv::ltv::status;
+pub use tsp_ltv::ltv::x509_ext;
+
+// Re-export key types
+pub use tsp_ltv::ltv::ChainBuilder;
+pub use tsp_ltv::ltv::CrlClient;
+pub use tsp_ltv::ltv::OcspClient;
+pub use tsp_ltv::ltv::{
+    AiaAccessMethod, extract_aia_urls,
     CertStatus, SingleResponse, ParsedBasicOcspResponse, ResponderId,
     build_ocsp_request_with_nonce, has_ocsp_nocheck_extension,
-    parse_ocsp_response, check_revocation as ocsp_check_revocation,
+    parse_ocsp_response, ocsp_check_revocation,
 };
-pub use revocation::{RevocationConfig, check_certificate_revocation};
+pub use tsp_ltv::ltv::{RevocationConfig, check_certificate_revocation};
 #[cfg(feature = "blocking")]
-pub use revocation::check_certificate_revocation_blocking;
-pub use status::{ValidationStatus, RevocationSource, RevocationReason, resolve_priority};
-pub use x509_ext::{
+pub use tsp_ltv::ltv::check_certificate_revocation_blocking;
+pub use tsp_ltv::ltv::{ValidationStatus, RevocationSource, RevocationReason, resolve_priority};
+pub use tsp_ltv::ltv::{
     KeyUsageBits, CertRole,
     check_basic_constraints, check_key_usage, check_extended_key_usage,
     has_extension, validate_extensions_for_role,
 };
+
+// DSS re-exports (local)
+pub use dss::{DssBuilder, VriEntry, compute_vri_key};

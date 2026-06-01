@@ -29,11 +29,13 @@
 pub mod core;
 pub mod cms;
 pub mod crypto;
-pub mod der_utils;
 pub mod error;
 pub mod remote;
 pub mod signer;
-pub mod trust;
+
+// Re-export shared infrastructure from tsp-ltv
+pub use tsp_ltv::der_utils;
+pub use tsp_ltv::trust;
 
 // Policy module — always compiled (core types don't need features;
 // the SignatureValidationPolicy trait requires `verify`)
@@ -41,7 +43,7 @@ pub mod policy;
 
 // Feature-gated modules
 #[cfg(feature = "tsp")]
-pub mod tsp;
+pub use tsp_ltv::tsp;
 
 #[cfg(feature = "ltv")]
 pub mod ltv;

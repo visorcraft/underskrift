@@ -339,6 +339,13 @@ pub async fn validate_certificate_path(
 
         if revocation_status.is_revoked() {
             issues.push(format!("cert[{i}] ({subject}): {revocation_status}"));
+        } else if revocation_status.is_invalid() {
+            // Under a strict policy tsp-ltv fails closed: a revocation status
+            // that could not be established (no endpoints, unreachable, timed
+            // out) or that failed integrity validation is reported as Invalid.
+            issues.push(format!(
+                "cert[{i}] ({subject}): revocation check failed: {revocation_status}"
+            ));
         } else if revocation_status.is_unknown() && revocation_config.require_revocation_check {
             issues.push(format!(
                 "cert[{i}] ({subject}): revocation status unknown: {revocation_status}"
@@ -404,7 +411,19 @@ fn compute_path_status(
         }
     }
 
-    // Check for unknown revocation when required
+    // Check for a revocation status that explicitly failed validation. Under a
+    // strict policy tsp-ltv fails closed and reports a non-establishable or
+    // integrity-failed revocation result as Invalid; that must propagate to the
+    // overall path status rather than being mistaken for "fine to proceed".
+    for entry in entries {
+        if entry.revocation_status.is_invalid() {
+            return entry.revocation_status.clone();
+        }
+    }
+
+    // Check for unknown revocation when required. Under the strict policy above
+    // tsp-ltv upgrades Unknown to Invalid, so this branch covers callers that
+    // surface an Unknown despite requiring a check (defensive).
     if config.require_revocation_check {
         for entry in entries {
             if entry.revocation_status.is_unknown() {
@@ -576,10 +595,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_path_validation_trusted_chain_unknown_revocation() {
-            // Our test certs have no OCSP/CRL endpoints, so revocation will
-            // be Unknown. With require_revocation_check = true, overall should
-            // be Unknown.
+        async fn test_path_validation_trusted_chain_revocation_fails_closed() {
+            // Our test certs have no OCSP/CRL endpoints, so revocation cannot
+            // be established. With require_revocation_check = true, tsp-ltv
+            // fails closed: the revocation status is reported as Invalid and
+            // the overall path status must be Invalid (not Unknown, not Valid).
             let signer = signer_cert();
             let intermediate = intermediate_cert();
             let embedded = vec![signer.clone(), intermediate.clone()];
@@ -606,12 +626,12 @@ mod tests {
                 result.issues
             );
 
-            // But overall status should be Unknown because revocation
-            // could not be checked (no endpoints)
+            // But overall status should be Invalid because revocation could
+            // not be checked (no endpoints) and the policy fails closed.
             assert!(
-                result.overall_status.is_unknown(),
-                "overall should be Unknown when revocation is required but \
-                 certs have no OCSP/CRL endpoints, got: {}",
+                result.overall_status.is_invalid(),
+                "overall should be Invalid when revocation is required but \
+                 certs have no OCSP/CRL endpoints (fail-closed), got: {}",
                 result.overall_status
             );
 
@@ -627,8 +647,8 @@ mod tests {
                 assert!(entry.chain_valid, "chain should be valid for {}", entry.subject);
                 assert!(entry.time_valid, "time should be valid for {}", entry.subject);
                 assert!(
-                    entry.revocation_status.is_unknown(),
-                    "revocation should be unknown for {} (no endpoints)",
+                    entry.revocation_status.is_invalid(),
+                    "revocation should be Invalid (fail-closed) for {} (no endpoints)",
                     entry.subject
                 );
             }

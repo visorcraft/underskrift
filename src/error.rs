@@ -143,42 +143,13 @@ pub enum SigningError {
     Config(String),
 }
 
-/// Errors from the `tsp` module — RFC 3161 timestamping.
+/// Errors from the `tsp` module — RFC 3161 timestamping (from tsp-ltv).
 #[cfg(feature = "tsp")]
-#[derive(Debug, Error)]
-pub enum TspError {
-    #[error("TSA HTTP request failed: {0}")]
-    HttpError(String),
+pub use tsp_ltv::error::TspError;
 
-    #[error("TSA returned error status: {0}")]
-    TsaError(String),
-
-    #[error("invalid timestamp response: {0}")]
-    InvalidResponse(String),
-}
-
-/// Errors from the `ltv` module — long-term validation.
+/// Errors from the `ltv` module — long-term validation (from tsp-ltv).
 #[cfg(feature = "ltv")]
-#[derive(Debug, Error)]
-pub enum LtvError {
-    #[error("OCSP error: {0}")]
-    Ocsp(String),
-
-    #[error("CRL error: {0}")]
-    Crl(String),
-
-    #[error("certificate chain error: {0}")]
-    Chain(String),
-
-    #[error("DSS construction error: {0}")]
-    Dss(String),
-
-    #[error("revocation check error: {0}")]
-    Revocation(String),
-
-    #[error("X.509 extension validation error: {0}")]
-    X509Extension(String),
-}
+pub use tsp_ltv::error::LtvError;
 
 /// Errors from the `verify` module — signature verification.
 #[cfg(feature = "verify")]
@@ -203,52 +174,8 @@ pub enum VerifyError {
     Revoked(String),
 }
 
-/// Errors from the `trust` module — trust store management.
-#[derive(Debug, Error)]
-pub enum TrustError {
-    #[error("certificate parse error: {0}")]
-    CertificateParse(String),
-
-    #[error("path is not a directory: {0}")]
-    NotADirectory(String),
-
-    #[error("certificate chain is empty")]
-    EmptyChain,
-
-    #[error("chain broken at index {index}: expected issuer {expected_issuer}, found subject {found_subject}")]
-    ChainBroken {
-        index: usize,
-        expected_issuer: String,
-        found_subject: String,
-    },
-
-    #[error("certificate at index {index} is not yet valid (not_before: {not_before})")]
-    NotYetValid {
-        index: usize,
-        not_before: der::DateTime,
-    },
-
-    #[error("certificate at index {index} is expired (not_after: {not_after})")]
-    Expired {
-        index: usize,
-        not_after: der::DateTime,
-    },
-
-    #[error("untrusted root: no trust anchor found for issuer {issuer}")]
-    UntrustedRoot { issuer: String },
-
-    #[error("signature verification failed: {0}")]
-    SignatureVerification(String),
-
-    #[error("unsupported signature algorithm: {0}")]
-    UnsupportedAlgorithm(String),
-
-    #[error("trust store not configured for {0}")]
-    StoreNotConfigured(String),
-
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-}
+/// Errors from the `trust` module — trust store management (from tsp-ltv).
+pub use tsp_ltv::error::TrustError;
 
 /// Errors from the `saci` module — SACI AuthnContext extension parsing.
 #[cfg(feature = "saci")]
