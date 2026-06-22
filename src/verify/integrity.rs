@@ -42,6 +42,28 @@ pub fn verify_byte_range(
     byte_range: &[usize; 4],
     digest_alg: DigestAlgorithm,
 ) -> IntegrityResult {
+    verify_byte_range_ex(pdf_data, byte_range, digest_alg, None, false)
+}
+
+/// Like [`verify_byte_range`], with two additional binding checks used by the
+/// main verification path:
+///
+/// - `expected_contents`: when `Some`, the bytes parsed from the signature
+///   dictionary's `/Contents`. The hex string in the ByteRange gap is decoded
+///   and must equal these bytes. This binds the gap to the *actual* signature
+///   under verification, defeating a signature-wrapping attack that points the
+///   ByteRange at a decoy `<...>` token while the real `/Contents` lives
+///   elsewhere.
+/// - `require_eof_coverage`: when `true` (the final signature in the document),
+///   the second range must extend to EOF. Bytes appended after the last
+///   signature are an integrity failure, not merely informational.
+pub fn verify_byte_range_ex(
+    pdf_data: &[u8],
+    byte_range: &[usize; 4],
+    digest_alg: DigestAlgorithm,
+    expected_contents: Option<&[u8]>,
+    require_eof_coverage: bool,
+) -> IntegrityResult {
     let file_len = pdf_data.len();
     let mut issues = Vec::new();
 
@@ -95,11 +117,40 @@ pub fn verify_byte_range(
             // delimited by '<' and '>' — this is what a legitimate /Contents
             // value looks like in the raw PDF bytes.
             validate_contents_gap(pdf_data, gap_start, gap_end, &mut issues);
+
+            // Stronger binding: the hex in the gap must decode to the exact
+            // signature `/Contents` we parsed. Otherwise the ByteRange is
+            // pointing at a decoy token (signature wrapping attack).
+            if let Some(expected) = expected_contents {
+                if let Some(decoded) = decode_contents_gap(pdf_data, gap_start, gap_end) {
+                    let mismatch = decoded.len() < expected.len()
+                        || &decoded[..expected.len()] != expected
+                        || decoded[expected.len()..].iter().any(|b| *b != 0);
+                    if mismatch {
+                        issues.push(
+                            "ByteRange gap does not match the signature's parsed /Contents; \
+                             possible signature wrapping attack"
+                                .to_string(),
+                        );
+                    }
+                }
+                // If the gap is not decodable as hex, validate_contents_gap
+                // already recorded an issue above.
+            }
         }
     }
 
     // Check 5: Second range should extend to EOF for complete coverage
     let covers_whole_file = end2 == file_len;
+
+    // For the final signature in a document, failing to cover to EOF means
+    // bytes were appended after signing — a genuine integrity failure.
+    if require_eof_coverage && !covers_whole_file {
+        issues.push(format!(
+            "final signature does not cover to end of file: range ends at {end2}, file is {file_len} bytes \
+             (content was appended after signing)"
+        ));
+    }
 
     // Note: Not covering to EOF is expected for non-final signatures in
     // multi-signature PDFs (e.g., when a document timestamp was added after
@@ -181,6 +232,31 @@ fn validate_contents_gap(
             "ByteRange gap hex string has odd length (expected even for byte encoding)".to_string(),
         );
     }
+}
+
+/// Decode the hex string in a `<...>` ByteRange gap to its raw bytes.
+///
+/// Returns `None` if the gap is not a well-formed `<hex>` token (in which case
+/// [`validate_contents_gap`] has already flagged it). Whitespace between hex
+/// digits is permitted (PDF hex strings allow it).
+fn decode_contents_gap(pdf_data: &[u8], gap_start: usize, gap_end: usize) -> Option<Vec<u8>> {
+    let gap = pdf_data.get(gap_start..gap_end)?;
+    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
+        return None;
+    }
+    let mut nibbles = Vec::new();
+    for &b in &gap[1..gap.len() - 1] {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        let v = (b as char).to_digit(16)?;
+        nibbles.push(v as u8);
+    }
+    // PDF hex strings with an odd number of digits pad the final nibble with 0.
+    if nibbles.len() % 2 == 1 {
+        nibbles.push(0);
+    }
+    Some(nibbles.chunks(2).map(|c| (c[0] << 4) | c[1]).collect())
 }
 
 /// Compute the hash of the byte-range-selected portions of the PDF.
@@ -435,6 +511,84 @@ mod tests {
             "should warn about odd hex length; issues: {:?}",
             result.issues
         );
+    }
+
+    // ── U-6: /Contents binding + final-signature EOF coverage ──────────
+
+    #[test]
+    fn test_contents_binding_matches() {
+        // Gap filled with '0' hex decodes to all-zero bytes. The parsed
+        // /Contents must be a prefix, and the rest may only be zero padding.
+        let pdf_data = build_pdf_with_valid_gap(1000, 400, 500);
+        let byte_range = [0, 400, 500, 500];
+        let result = verify_byte_range_ex(
+            &pdf_data,
+            &byte_range,
+            DigestAlgorithm::Sha256,
+            Some(&[0u8; 8]),
+            false,
+        );
+        assert!(
+            result.valid,
+            "matching contents should pass: {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn test_contents_binding_mismatch_is_swa() {
+        // The gap decodes to zero bytes, but the parsed /Contents is non-zero:
+        // the ByteRange is pointing at a decoy token, not the real signature.
+        let pdf_data = build_pdf_with_valid_gap(1000, 400, 500);
+        let byte_range = [0, 400, 500, 500];
+        let result = verify_byte_range_ex(
+            &pdf_data,
+            &byte_range,
+            DigestAlgorithm::Sha256,
+            Some(&[0xAB, 0xCD]),
+            false,
+        );
+        assert!(!result.valid);
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|i| i.contains("does not match the signature's parsed /Contents")),
+            "should flag contents mismatch as SWA; issues: {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn test_final_signature_must_cover_eof() {
+        // A non-final signature not covering EOF is fine...
+        let pdf_data = build_pdf_with_valid_gap(1000, 400, 500);
+        let byte_range = [0, 400, 500, 400]; // ends at 900, file is 1000
+        let non_final =
+            verify_byte_range_ex(&pdf_data, &byte_range, DigestAlgorithm::Sha256, None, false);
+        assert!(non_final.valid, "non-final under-coverage is informational");
+
+        // ...but the FINAL signature must reach EOF.
+        let final_sig =
+            verify_byte_range_ex(&pdf_data, &byte_range, DigestAlgorithm::Sha256, None, true);
+        assert!(!final_sig.valid);
+        assert!(
+            final_sig
+                .issues
+                .iter()
+                .any(|i| i.contains("does not cover to end of file")),
+            "final signature under-coverage must be an integrity error; issues: {:?}",
+            final_sig.issues
+        );
+    }
+
+    #[test]
+    fn test_decode_contents_gap_roundtrip() {
+        let mut data = vec![0u8; 64];
+        let gap = b"<00aBcd00>";
+        data[10..10 + gap.len()].copy_from_slice(gap);
+        let decoded = decode_contents_gap(&data, 10, 10 + gap.len()).expect("decodable");
+        assert_eq!(decoded, vec![0x00, 0xAB, 0xCD, 0x00]);
     }
 
     #[test]

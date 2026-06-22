@@ -4,6 +4,7 @@
 //! trailer /Size, root catalog ID) and parses existing signature dictionaries
 //! for verification and multi-signature support.
 
+use lopdf::xref::XrefType;
 use lopdf::{Document, Object, ObjectId};
 
 use crate::error::CoreError;
@@ -20,6 +21,19 @@ pub struct PdfMetadata {
     pub root_id: ObjectId,
     /// The maximum object ID used in the document.
     pub max_id: u32,
+    /// The trailer `/ID` array, if present. Must be carried forward into the
+    /// incremental update's trailer (required for encrypted PDFs and PDF/A,
+    /// and expected by many validators).
+    pub id: Option<Object>,
+    /// The trailer `/Encrypt` entry, if present. Carried forward so the
+    /// incremental update remains structurally consistent with an encrypted
+    /// document.
+    pub encrypt: Option<Object>,
+    /// Whether the document's most recent cross-reference section is a
+    /// cross-reference **stream** (PDF 1.5+) rather than a classic `xref`
+    /// table. When true, the incremental update must also be written as an
+    /// XRef stream so the chain remains consistent for strict readers.
+    pub uses_xref_stream: bool,
 }
 
 /// Information about an existing signature in a PDF.
@@ -67,11 +81,25 @@ pub fn extract_metadata(doc: &Document) -> Result<PdfMetadata, CoreError> {
         .and_then(Object::as_reference)
         .map_err(|_| CoreError::InvalidStructure("trailer missing /Root".into()))?;
 
+    // Preserve /ID and /Encrypt from the trailer so the incremental update's
+    // trailer stays structurally faithful (dropping /ID breaks PDF/A and many
+    // validators; dropping /Encrypt corrupts encrypted documents).
+    let id = doc.trailer.get(b"ID").ok().cloned();
+    let encrypt = doc.trailer.get(b"Encrypt").ok().cloned();
+
+    let uses_xref_stream = matches!(
+        doc.reference_table.cross_reference_type,
+        XrefType::CrossReferenceStream
+    );
+
     Ok(PdfMetadata {
         xref_offset,
         trailer_size,
         root_id,
         max_id: doc.max_id,
+        id,
+        encrypt,
+        uses_xref_stream,
     })
 }
 

@@ -67,7 +67,10 @@ pub mod report;
 pub mod inspect;
 
 // Public re-exports for convenience
-pub use cms::builder::{CmsProfile, SigningTimePlacement};
+pub use cms::builder::{CmsProfile, CommitmentType, SignaturePolicy, SigningTimePlacement};
+/// Detached CAdES (ETSI EN 319 122-1) construction and qualifying properties.
+pub use cms::cades;
+pub use core::doc_mdp::DocMdpPermissions;
 pub use core::doc_timestamp::DocTimestampOptions;
 pub use crypto::algorithm::{AlgorithmRegistry, DigestAlgorithm, SignatureAlgorithm};
 pub use crypto::software::SoftwareSigner;

@@ -33,6 +33,42 @@ use crate::error::CmsError;
 pub(crate) const ID_AA_CMS_ALGORITHM_PROTECTION: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.52");
 
+/// `id-ecdsa-with-sha3-256` (NIST, RFC 8692): `2.16.840.1.101.3.4.3.10`.
+const OID_ECDSA_WITH_SHA3_256: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10");
+/// `id-ecdsa-with-sha3-384` (NIST, RFC 8692): `2.16.840.1.101.3.4.3.11`.
+const OID_ECDSA_WITH_SHA3_384: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.11");
+/// `id-ecdsa-with-sha3-512` (NIST, RFC 8692): `2.16.840.1.101.3.4.3.12`.
+const OID_ECDSA_WITH_SHA3_512: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.12");
+
+/// `id-aa-ets-commitmentType` (ETSI TS 119 122-1 / RFC 5126):
+/// `1.2.840.113549.1.9.16.2.16`.
+const OID_AA_ETS_COMMITMENT_TYPE: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.16");
+/// `id-aa-ets-sigPolicyId` (signature-policy-identifier):
+/// `1.2.840.113549.1.9.16.2.15`.
+const OID_AA_ETS_SIG_POLICY_ID: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.15");
+/// `id-spq-ets-uri` — the SPURI qualifier identifier:
+/// `1.2.840.113549.1.9.16.5.1`.
+const OID_SPQ_ETS_URI: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.5.1");
+
+/// Select the ECDSA signature-algorithm OID for a digest. For ECDSA the OID
+/// encodes the hash function (not the curve), per RFC 5758 (SHA-2) and
+/// RFC 8692 (SHA-3).
+fn ecdsa_signature_oid(digest: DigestAlgorithm) -> ObjectIdentifier {
+    match digest {
+        DigestAlgorithm::Sha256 => rfc5912::ECDSA_WITH_SHA_256,
+        DigestAlgorithm::Sha384 => rfc5912::ECDSA_WITH_SHA_384,
+        DigestAlgorithm::Sha512 => crate::crypto::algorithm::OID_ECDSA_WITH_SHA512,
+        DigestAlgorithm::Sha3_256 => OID_ECDSA_WITH_SHA3_256,
+        DigestAlgorithm::Sha3_384 => OID_ECDSA_WITH_SHA3_384,
+        DigestAlgorithm::Sha3_512 => OID_ECDSA_WITH_SHA3_512,
+    }
+}
+
 /// Build the RSASSA-PSS-params ASN.1 structure for a given digest algorithm.
 ///
 /// Encodes the AlgorithmIdentifier parameters for RSASSA-PSS (RFC 4055):
@@ -88,6 +124,66 @@ pub(crate) fn rsassa_pss_params_any(digest: DigestAlgorithm) -> Result<Any, Stri
         .map_err(|e| format!("RSASSA-PSS params Any: {e}"))
 }
 
+/// ETSI commitment type for the `commitment-type-indication` signed attribute
+/// (ETSI TS 119 122-1, RFC 5126 §5.11.1). Identifies what the signer commits to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitmentType {
+    /// `id-cti-ets-proofOfOrigin` — the signer commits to being the originator.
+    ProofOfOrigin,
+    /// `id-cti-ets-proofOfReceipt` — proof the signer received the content.
+    ProofOfReceipt,
+    /// `id-cti-ets-proofOfDelivery` — proof the content was delivered.
+    ProofOfDelivery,
+    /// `id-cti-ets-proofOfSender` — proof the signer sent the content.
+    ProofOfSender,
+    /// `id-cti-ets-proofOfApproval` — the signer approves the content.
+    ProofOfApproval,
+    /// `id-cti-ets-proofOfCreation` — the signer created the content.
+    ProofOfCreation,
+}
+
+impl CommitmentType {
+    /// The `id-cti-ets-*` object identifier for this commitment type
+    /// (arc `1.2.840.113549.1.9.16.6.{1..6}`).
+    pub fn oid(self) -> ObjectIdentifier {
+        match self {
+            CommitmentType::ProofOfOrigin => {
+                ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.6.1")
+            }
+            CommitmentType::ProofOfReceipt => {
+                ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.6.2")
+            }
+            CommitmentType::ProofOfDelivery => {
+                ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.6.3")
+            }
+            CommitmentType::ProofOfSender => {
+                ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.6.4")
+            }
+            CommitmentType::ProofOfApproval => {
+                ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.6.5")
+            }
+            CommitmentType::ProofOfCreation => {
+                ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.6.6")
+            }
+        }
+    }
+}
+
+/// Signature policy for the `signature-policy-identifier` signed attribute
+/// (ETSI TS 119 122-1, RFC 5126 §5.8.1). Binds the signature to an explicit,
+/// hash-committed signature policy document.
+#[derive(Debug, Clone)]
+pub struct SignaturePolicy {
+    /// The signature policy object identifier (`sigPolicyId`).
+    pub policy_id: ObjectIdentifier,
+    /// Digest algorithm used to hash the policy document (`sigPolicyHash`).
+    pub hash_algorithm: DigestAlgorithm,
+    /// The digest of the signature policy document.
+    pub hash_value: Vec<u8>,
+    /// Optional `SPURI` qualifier: a URL where the policy can be retrieved.
+    pub uri: Option<String>,
+}
+
 /// The mode of CMS construction — affects which signed attributes are included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CmsProfile {
@@ -96,6 +192,10 @@ pub enum CmsProfile {
     Pades,
     /// Traditional (adbe.pkcs7.detached): allows signingTime, no signingCertificateV2 required
     Traditional,
+    /// Detached CAdES baseline (ETSI EN 319 122-1): requires signingCertificateV2
+    /// **and** includes signingTime as a signed attribute. Unlike PAdES, the
+    /// signing time lives in the CMS rather than the PDF.
+    Cades,
 }
 
 /// Controls where the `signingTime` attribute is placed in the CMS structure.
@@ -157,6 +257,10 @@ pub struct PdfCmsBuilder<'a> {
     profile: CmsProfile,
     /// Where to place the signingTime attribute
     signing_time_placement: SigningTimePlacement,
+    /// Optional commitment-type-indication signed attribute
+    commitment_type: Option<CommitmentType>,
+    /// Optional signature-policy-identifier signed attribute
+    signature_policy: Option<SignaturePolicy>,
 }
 
 impl<'a> PdfCmsBuilder<'a> {
@@ -168,7 +272,23 @@ impl<'a> PdfCmsBuilder<'a> {
             signing_time: None,
             profile: CmsProfile::default(),
             signing_time_placement: SigningTimePlacement::default(),
+            commitment_type: None,
+            signature_policy: None,
         }
+    }
+
+    /// Include a `commitment-type-indication` signed attribute identifying what
+    /// the signer commits to (e.g. proof of origin/approval).
+    pub fn commitment_type(mut self, commitment: CommitmentType) -> Self {
+        self.commitment_type = Some(commitment);
+        self
+    }
+
+    /// Include a `signature-policy-identifier` signed attribute binding the
+    /// signature to an explicit, hash-committed signature policy.
+    pub fn signature_policy(mut self, policy: SignaturePolicy) -> Self {
+        self.signature_policy = Some(policy);
+        self
     }
 
     /// Set whether to embed the full certificate chain.
@@ -508,12 +628,28 @@ impl<'a> PdfCmsBuilder<'a> {
                     }
                 }
             }
+            CmsProfile::Cades => {
+                // CAdES baseline requires signingCertificateV2 and includes
+                // signingTime as a signed attribute when available.
+                attrs.push(self.build_signing_certificate_v2_attr(cert)?);
+                if let Some(time) = &self.signing_time {
+                    attrs.push(build_signing_time_attr(time)?);
+                }
+            }
         }
 
         // 4. CMS Algorithm Protection (RFC 6211) — always included
         let digest_alg = self.digest_algorithm_identifier();
         let sig_alg = self.signature_algorithm_identifier()?;
         attrs.push(build_cms_algorithm_protection_attr(&digest_alg, &sig_alg)?);
+
+        // 5. Optional ETSI qualifying properties.
+        if let Some(commitment) = self.commitment_type {
+            attrs.push(build_commitment_type_attr(commitment)?);
+        }
+        if let Some(policy) = &self.signature_policy {
+            attrs.push(build_signature_policy_attr(policy)?);
+        }
 
         SetOfVec::try_from(attrs)
             .map_err(|e| CmsError::Builder(format!("failed to build signed attributes set: {e}")))
@@ -690,8 +826,13 @@ impl<'a> PdfCmsBuilder<'a> {
                     .map_err(|e| CmsError::Der(format!("RSA-PSS params: {e}")))?;
                 (OID_RSASSA_PSS, Some(params))
             }
-            (SignatureAlgorithm::EcdsaP256, _) => (rfc5912::ECDSA_WITH_SHA_256, None),
-            (SignatureAlgorithm::EcdsaP384, _) => (rfc5912::ECDSA_WITH_SHA_384, None),
+            // The ECDSA signature-algorithm OID is determined by the *digest*,
+            // not the curve (RFC 5758 / RFC 8692). A previous version keyed it
+            // off the curve, so e.g. ECDSA-P256 + SHA-384 wrongly emitted
+            // `ecdsa-with-SHA256` and ECDSA + SHA-3 was mis-encoded entirely.
+            (SignatureAlgorithm::EcdsaP256, digest) | (SignatureAlgorithm::EcdsaP384, digest) => {
+                (ecdsa_signature_oid(digest), None)
+            }
             (SignatureAlgorithm::Ed25519, _) => (crate::crypto::algorithm::OID_ED25519, None),
         };
 
@@ -746,6 +887,98 @@ fn build_content_type_attr() -> Result<Attribute, CmsError> {
 
     Ok(Attribute {
         oid: rfc5911::ID_CONTENT_TYPE,
+        values,
+    })
+}
+
+/// Build the `commitment-type-indication` signed attribute (RFC 5126 §5.11.1).
+///
+/// ```text
+/// CommitmentTypeIndication ::= SEQUENCE {
+///   commitmentTypeId   CommitmentTypeIdentifier,
+///   commitmentTypeQualifier SEQUENCE OF CommitmentTypeQualifier OPTIONAL }
+/// ```
+/// We emit only the mandatory `commitmentTypeId` (no qualifiers).
+fn build_commitment_type_attr(commitment: CommitmentType) -> Result<Attribute, CmsError> {
+    let oid_der = commitment
+        .oid()
+        .to_der()
+        .map_err(|e| CmsError::Der(format!("commitment OID encode: {e}")))?;
+    let indication_der = encode_sequence(&[&oid_der]);
+
+    let value = AttributeValue::from_der(&indication_der)
+        .map_err(|e| CmsError::Der(format!("commitment value parse: {e}")))?;
+    let mut values = SetOfVec::new();
+    values
+        .insert(value)
+        .map_err(|e| CmsError::Builder(format!("insert commitment value: {e}")))?;
+
+    Ok(Attribute {
+        oid: OID_AA_ETS_COMMITMENT_TYPE,
+        values,
+    })
+}
+
+/// Build the `signature-policy-identifier` signed attribute (RFC 5126 §5.8.1).
+///
+/// ```text
+/// SignaturePolicyId ::= SEQUENCE {
+///   sigPolicyId         OBJECT IDENTIFIER,
+///   sigPolicyHash       OtherHashAlgAndValue,
+///   sigPolicyQualifiers SEQUENCE OF SigPolicyQualifierInfo OPTIONAL }
+/// OtherHashAlgAndValue ::= SEQUENCE { hashAlgorithm AlgorithmIdentifier, hashValue OCTET STRING }
+/// ```
+/// An optional `SPURI` qualifier carries a retrieval URL.
+fn build_signature_policy_attr(policy: &SignaturePolicy) -> Result<Attribute, CmsError> {
+    // sigPolicyId
+    let policy_oid_der = policy
+        .policy_id
+        .to_der()
+        .map_err(|e| CmsError::Der(format!("policy OID encode: {e}")))?;
+
+    // sigPolicyHash = OtherHashAlgAndValue
+    let hash_alg = AlgorithmIdentifierOwned {
+        oid: policy.hash_algorithm.oid(),
+        parameters: None,
+    };
+    let hash_alg_der = hash_alg
+        .to_der()
+        .map_err(|e| CmsError::Der(format!("policy hash alg encode: {e}")))?;
+    let hash_octet = OctetString::new(policy.hash_value.clone())
+        .map_err(|e| CmsError::Der(format!("policy hash octet: {e}")))?;
+    let hash_octet_der = hash_octet
+        .to_der()
+        .map_err(|e| CmsError::Der(format!("policy hash octet encode: {e}")))?;
+    let other_hash_der = encode_sequence(&[&hash_alg_der, &hash_octet_der]);
+
+    // Optional SPURI qualifier: SEQUENCE OF SigPolicyQualifierInfo
+    let mut parts: Vec<Vec<u8>> = vec![policy_oid_der, other_hash_der];
+    if let Some(uri) = &policy.uri {
+        let spq_oid_der = OID_SPQ_ETS_URI
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("SPURI OID encode: {e}")))?;
+        let uri_ia5 = der::asn1::Ia5String::new(uri)
+            .map_err(|e| CmsError::Der(format!("SPURI is not valid IA5: {e}")))?;
+        let uri_der = uri_ia5
+            .to_der()
+            .map_err(|e| CmsError::Der(format!("SPURI encode: {e}")))?;
+        let qualifier_info_der = encode_sequence(&[&spq_oid_der, &uri_der]);
+        let qualifiers_der = encode_sequence(&[&qualifier_info_der]);
+        parts.push(qualifiers_der);
+    }
+
+    let part_refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let sig_policy_id_der = encode_sequence(&part_refs);
+
+    let value = AttributeValue::from_der(&sig_policy_id_der)
+        .map_err(|e| CmsError::Der(format!("signature-policy value parse: {e}")))?;
+    let mut values = SetOfVec::new();
+    values
+        .insert(value)
+        .map_err(|e| CmsError::Builder(format!("insert signature-policy value: {e}")))?;
+
+    Ok(Attribute {
+        oid: OID_AA_ETS_SIG_POLICY_ID,
         values,
     })
 }
@@ -1014,6 +1247,102 @@ pub(crate) mod tests {
     ) -> Attribute {
         build_cms_algorithm_protection_attr(digest_alg, sig_alg)
             .expect("failed to build CMS-AP for test")
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn commitment_type_attr_structure() {
+        let attr = build_commitment_type_attr(CommitmentType::ProofOfApproval)
+            .expect("build commitment attr");
+        assert_eq!(attr.oid, OID_AA_ETS_COMMITMENT_TYPE);
+
+        // The single value is SEQUENCE { commitmentTypeId OID }.
+        let value_der = attr.values.as_slice()[0].to_der().unwrap();
+        assert_eq!(value_der[0], 0x30, "value must be a SEQUENCE");
+        let oid_der = CommitmentType::ProofOfApproval.oid().to_der().unwrap();
+        assert!(
+            contains_subslice(&value_der, &oid_der),
+            "value must carry the proofOfApproval OID"
+        );
+    }
+
+    #[test]
+    fn signature_policy_attr_structure_with_spuri() {
+        let policy = SignaturePolicy {
+            policy_id: ObjectIdentifier::new_unwrap("1.2.3.4.5"),
+            hash_algorithm: DigestAlgorithm::Sha256,
+            hash_value: vec![0xAB; 32],
+            uri: Some("https://policy.example/policy.der".to_string()),
+        };
+        let attr = build_signature_policy_attr(&policy).expect("build policy attr");
+        assert_eq!(attr.oid, OID_AA_ETS_SIG_POLICY_ID);
+
+        let value_der = attr.values.as_slice()[0].to_der().unwrap();
+        assert_eq!(value_der[0], 0x30, "value must be a SEQUENCE");
+        // Carries the policy OID, the hash bytes, and the SPURI qualifier OID.
+        assert!(contains_subslice(
+            &value_der,
+            &policy.policy_id.to_der().unwrap()
+        ));
+        assert!(contains_subslice(&value_der, &[0xAB; 32]));
+        assert!(contains_subslice(
+            &value_der,
+            &OID_SPQ_ETS_URI.to_der().unwrap()
+        ));
+        assert!(
+            contains_subslice(&value_der, b"https://policy.example/policy.der"),
+            "SPURI URL must be embedded as IA5String"
+        );
+    }
+
+    #[test]
+    fn signature_policy_attr_without_uri_omits_qualifiers() {
+        let policy = SignaturePolicy {
+            policy_id: ObjectIdentifier::new_unwrap("1.2.3.4.5"),
+            hash_algorithm: DigestAlgorithm::Sha256,
+            hash_value: vec![0x11; 32],
+            uri: None,
+        };
+        let attr = build_signature_policy_attr(&policy).expect("build policy attr");
+        let value_der = attr.values.as_slice()[0].to_der().unwrap();
+        // No SPURI qualifier OID should appear when no URI is configured.
+        assert!(!contains_subslice(
+            &value_der,
+            &OID_SPQ_ETS_URI.to_der().unwrap()
+        ));
+    }
+
+    #[test]
+    fn ecdsa_signature_oid_is_digest_driven() {
+        // The ECDSA signature OID must reflect the digest, not the curve, so
+        // that a non-default curve/hash pairing is encoded correctly.
+        assert_eq!(
+            ecdsa_signature_oid(DigestAlgorithm::Sha256),
+            rfc5912::ECDSA_WITH_SHA_256
+        );
+        assert_eq!(
+            ecdsa_signature_oid(DigestAlgorithm::Sha384),
+            rfc5912::ECDSA_WITH_SHA_384
+        );
+        assert_eq!(
+            ecdsa_signature_oid(DigestAlgorithm::Sha512),
+            crate::crypto::algorithm::OID_ECDSA_WITH_SHA512
+        );
+        assert_eq!(
+            ecdsa_signature_oid(DigestAlgorithm::Sha3_256),
+            OID_ECDSA_WITH_SHA3_256
+        );
+        assert_eq!(
+            ecdsa_signature_oid(DigestAlgorithm::Sha3_384),
+            OID_ECDSA_WITH_SHA3_384
+        );
+        assert_eq!(
+            ecdsa_signature_oid(DigestAlgorithm::Sha3_512),
+            OID_ECDSA_WITH_SHA3_512
+        );
     }
 
     #[test]

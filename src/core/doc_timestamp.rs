@@ -147,6 +147,7 @@ pub fn prepare_doc_timestamp(
 
     // The DocTimeStamp dict is the "sig dict" for ByteRange tracking
     writer.set_sig_dict_id(ts_dict_id);
+    writer.set_trailer_meta(meta.id.clone(), meta.encrypt.clone(), meta.uses_xref_stream);
 
     // Add new objects
     if let Ok(obj) = doc.get_object(ts_dict_id) {

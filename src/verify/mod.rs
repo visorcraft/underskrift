@@ -184,10 +184,14 @@ impl<'a> SignatureVerifier<'a> {
         let revision_analysis_failed = revision_analysis.is_none();
 
         let mut results = Vec::with_capacity(extracted.len());
-        let num_sigs = extracted.len();
+        let final_revision_end = extracted
+            .iter()
+            .map(|sig| signed_revision_end(&sig.byte_range))
+            .max()
+            .unwrap_or(0);
 
-        for (idx, sig) in extracted.iter().enumerate() {
-            let is_last = idx == num_sigs - 1;
+        for sig in &extracted {
+            let is_last = signed_revision_end(&sig.byte_range) == final_revision_end;
             let mut result =
                 self.verify_single_signature(pdf_data, sig, is_last, revision_analysis.as_ref());
 
@@ -204,16 +208,19 @@ impl<'a> SignatureVerifier<'a> {
             results.push(result);
         }
 
+        apply_document_timestamp_levels(&extracted, &mut results);
+
         // Compute summary stats
         let valid_count = results
             .iter()
             .filter(|r| r.status == SignatureStatus::Valid)
             .count();
         let invalid_count = results.len() - valid_count;
-        let document_modified = results
-            .last()
-            .map(|r| r.modifications_after_signing)
-            .unwrap_or(false);
+        let document_modified = extracted
+            .iter()
+            .zip(results.iter())
+            .filter(|(sig, _)| signed_revision_end(&sig.byte_range) == final_revision_end)
+            .any(|(_, result)| result.modifications_after_signing);
 
         // Policy stats
         let mut policy_passed_count = 0;
@@ -277,8 +284,13 @@ impl<'a> SignatureVerifier<'a> {
         // integrity check; we'll re-hash if CMS says otherwise.
         let default_digest = DigestAlgorithm::Sha256;
 
-        let integrity_result =
-            integrity::verify_byte_range(pdf_data, &sig.byte_range, default_digest);
+        let integrity_result = integrity::verify_byte_range_ex(
+            pdf_data,
+            &sig.byte_range,
+            default_digest,
+            Some(&sig.cms_bytes),
+            is_last,
+        );
         let integrity_ok = integrity_result.valid;
         let covers_whole_document = integrity_result.covers_whole_file;
         let integrity_issues = integrity_result.issues.clone();
@@ -618,8 +630,13 @@ impl<'a> SignatureVerifier<'a> {
         let default_digest = DigestAlgorithm::Sha256;
 
         // --- Step A: ByteRange integrity ---
-        let integrity_result =
-            integrity::verify_byte_range(pdf_data, &sig.byte_range, default_digest);
+        let integrity_result = integrity::verify_byte_range_ex(
+            pdf_data,
+            &sig.byte_range,
+            default_digest,
+            Some(&sig.cms_bytes),
+            is_last,
+        );
         let integrity_ok = integrity_result.valid;
         let covers_whole_document = integrity_result.covers_whole_file;
         let integrity_issues = integrity_result.issues.clone();
@@ -896,6 +913,50 @@ impl<'a> SignatureVerifier<'a> {
     }
 }
 
+/// Mark a PAdES signature as B-T when a later verified `/DocTimeStamp` covers
+/// the signed revision. The timestamp remains a separate report entry; this
+/// only reflects the effective baseline level of the covered signature.
+fn apply_document_timestamp_levels(
+    extracted: &[ExtractedSignature],
+    results: &mut [SignatureVerificationResult],
+) {
+    for sig_idx in 0..results.len() {
+        if extracted[sig_idx].signature_type != SignatureType::Pades {
+            continue;
+        }
+        if results[sig_idx].pades_level != DetectedPadesLevel::BB {
+            continue;
+        }
+
+        let pades_revision_end = signed_revision_end(&extracted[sig_idx].byte_range);
+        let has_covering_timestamp =
+            extracted
+                .iter()
+                .zip(results.iter())
+                .any(|(candidate, result)| {
+                    candidate.signature_type == SignatureType::DocTimestamp
+                        && result.status == SignatureStatus::Valid
+                        && result.integrity_ok
+                        && result.digest_matches
+                        && result.chain_trusted
+                        && signed_revision_end(&candidate.byte_range) > pades_revision_end
+                        && doc_timestamp_covers(candidate.byte_range, pades_revision_end)
+                });
+
+        if has_covering_timestamp {
+            results[sig_idx].pades_level = DetectedPadesLevel::BT;
+        }
+    }
+}
+
+fn signed_revision_end(byte_range: &[usize; 4]) -> usize {
+    byte_range[2].saturating_add(byte_range[3])
+}
+
+fn doc_timestamp_covers(timestamp_range: [usize; 4], covered_end: usize) -> bool {
+    timestamp_range[0] == 0 && covered_end <= timestamp_range[1]
+}
+
 /// Compute the overall signature status from sub-results.
 fn compute_overall_status(
     integrity_ok: bool,
@@ -935,5 +996,144 @@ fn build_summary(status: &SignatureStatus, issues: &[String]) -> String {
         status_str.to_string()
     } else {
         format!("{}: {}", status_str, issues.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verify::chain_verify::CertValidity;
+
+    fn extracted(signature_type: SignatureType, byte_range: [usize; 4]) -> ExtractedSignature {
+        ExtractedSignature {
+            field_name: String::new(),
+            signature_type,
+            byte_range,
+            cms_bytes: Vec::new(),
+            reason: None,
+            location: None,
+            contact_info: None,
+            signer_name: None,
+            signing_time: None,
+        }
+    }
+
+    fn result(
+        signature_type: SignatureType,
+        status: SignatureStatus,
+        pades_level: DetectedPadesLevel,
+    ) -> SignatureVerificationResult {
+        SignatureVerificationResult {
+            field_name: String::new(),
+            status,
+            signature_type,
+            signer_name: None,
+            signing_time: None,
+            cms_signing_time: None,
+            timestamp_time: None,
+            ess_cert_id_match: None,
+            validation_time_used: None,
+            integrity_ok: true,
+            covers_whole_document: true,
+            integrity_issues: Vec::new(),
+            cryptographic_validity: CryptoValidity::Valid,
+            digest_matches: true,
+            certificate_validity: CertValidity::Valid,
+            chain_trusted: true,
+            trust_anchor: None,
+            #[cfg(feature = "ltv")]
+            revocation_status: None,
+            #[cfg(not(feature = "ltv"))]
+            revocation_status: None,
+            #[cfg(feature = "ltv")]
+            per_cert_revocation: Vec::new(),
+            #[cfg(not(feature = "ltv"))]
+            per_cert_revocation: Vec::new(),
+            pades_level,
+            modifications_after_signing: false,
+            covers_whole_document_revision: None,
+            extended_by_non_safe_updates: None,
+            policy_result: None,
+            signer_cert_der: None,
+            chain_certs_der: Vec::new(),
+            signature_value_bytes: Vec::new(),
+            dtbsr_hash: Vec::new(),
+            signature_algorithm_oid: None,
+            timestamp_token_der: None,
+            summary: String::new(),
+        }
+    }
+
+    #[test]
+    fn valid_covering_doc_timestamp_marks_pades_as_bt() {
+        let extracted = vec![
+            extracted(SignatureType::Pades, [0, 40, 60, 40]),
+            extracted(SignatureType::DocTimestamp, [0, 140, 200, 50]),
+        ];
+        let mut results = vec![
+            result(
+                SignatureType::Pades,
+                SignatureStatus::Valid,
+                DetectedPadesLevel::BB,
+            ),
+            result(
+                SignatureType::DocTimestamp,
+                SignatureStatus::Valid,
+                DetectedPadesLevel::Unknown,
+            ),
+        ];
+
+        apply_document_timestamp_levels(&extracted, &mut results);
+
+        assert_eq!(results[0].pades_level, DetectedPadesLevel::BT);
+        assert_eq!(results[1].pades_level, DetectedPadesLevel::Unknown);
+    }
+
+    #[test]
+    fn covering_doc_timestamp_marks_pades_as_bt_regardless_of_field_order() {
+        let extracted = vec![
+            extracted(SignatureType::DocTimestamp, [0, 140, 200, 50]),
+            extracted(SignatureType::Pades, [0, 40, 60, 40]),
+        ];
+        let mut results = vec![
+            result(
+                SignatureType::DocTimestamp,
+                SignatureStatus::Valid,
+                DetectedPadesLevel::Unknown,
+            ),
+            result(
+                SignatureType::Pades,
+                SignatureStatus::Valid,
+                DetectedPadesLevel::BB,
+            ),
+        ];
+
+        apply_document_timestamp_levels(&extracted, &mut results);
+
+        assert_eq!(results[1].pades_level, DetectedPadesLevel::BT);
+    }
+
+    #[test]
+    fn invalid_doc_timestamp_does_not_mark_pades_as_bt() {
+        let extracted = vec![
+            extracted(SignatureType::Pades, [0, 40, 60, 40]),
+            extracted(SignatureType::DocTimestamp, [0, 140, 200, 50]),
+        ];
+        let mut results = vec![
+            result(
+                SignatureType::Pades,
+                SignatureStatus::Valid,
+                DetectedPadesLevel::BB,
+            ),
+            result(
+                SignatureType::DocTimestamp,
+                SignatureStatus::Invalid,
+                DetectedPadesLevel::Unknown,
+            ),
+        ];
+
+        apply_document_timestamp_levels(&extracted, &mut results);
+
+        assert_eq!(results[0].pades_level, DetectedPadesLevel::BB);
     }
 }

@@ -273,31 +273,87 @@ impl SvtValidator {
         }
     }
 
+    /// Verify that the leaf certificate of an `x5c` chain chains to one of the
+    /// supplied trust anchors, using the same chain-building and verification
+    /// logic as the main signature-verification path.
+    fn ensure_x5c_chains_to_trust(
+        chain_der: &[Vec<u8>],
+        trusted_certs_der: &[Vec<u8>],
+    ) -> Result<(), SvtError> {
+        use x509_cert::Certificate;
+
+        let leaf = Certificate::from_der(&chain_der[0])
+            .map_err(|e| SvtError::JwtVerification(format!("x5c leaf parse: {e}")))?;
+        let embedded: Vec<Certificate> = chain_der
+            .iter()
+            .filter_map(|der| Certificate::from_der(der).ok())
+            .collect();
+
+        let mut store = crate::trust::TrustStore::new();
+        for der in trusted_certs_der {
+            // Skip anchors we cannot parse rather than failing the whole check;
+            // a malformed anchor must not grant trust, but it also should not
+            // block a valid one.
+            let _ = store.add_der_certificate(der);
+        }
+
+        let result = crate::verify::chain_verify::verify_chain(&leaf, &embedded, &store);
+        if result.trusted {
+            Ok(())
+        } else {
+            Err(SvtError::JwtVerification(format!(
+                "SVT x5c certificate is not trusted: {}",
+                result.issues.join("; ")
+            )))
+        }
+    }
+
     /// Resolve the verification certificate from JWT header or trusted certs.
     fn resolve_verification_cert(
         header: &josekit::jws::JwsHeader,
         trusted_certs_der: &[Vec<u8>],
     ) -> Result<Vec<u8>, SvtError> {
-        // Try x5c header first
+        // Try x5c header first. The x5c array carries the signing certificate
+        // (first element) optionally followed by CA intermediates. The signing
+        // certificate MUST be trusted — either it is itself one of the supplied
+        // trust anchors, or it chains to one. We never trust an inline x5c
+        // certificate on its own say-so.
         if let Some(x5c_value) = header.claim("x5c") {
             if let Some(arr) = x5c_value.as_array() {
-                if let Some(first) = arr.first() {
-                    if let Some(b64_cert) = first.as_str() {
-                        let cert_der = B64
-                            .decode(b64_cert)
-                            .map_err(|e| SvtError::JwtVerification(format!("x5c decode: {e}")))?;
-                        // Verify the cert is trusted
-                        if !trusted_certs_der.is_empty() {
-                            let is_trusted = trusted_certs_der.contains(&cert_der);
-                            if !is_trusted {
-                                // For now, accept it — in production you'd
-                                // validate the chain against trusted_certs_der
-                                log::warn!("SVT signing cert from x5c not found in trusted store; accepting for now");
-                            }
-                        }
-                        return Ok(cert_der);
-                    }
+                // Decode every certificate in the x5c chain (DER from base64).
+                let mut chain_der: Vec<Vec<u8>> = Vec::with_capacity(arr.len());
+                for entry in arr {
+                    let b64_cert = entry.as_str().ok_or_else(|| {
+                        SvtError::JwtVerification("x5c entry is not a string".into())
+                    })?;
+                    let der = B64
+                        .decode(b64_cert)
+                        .map_err(|e| SvtError::JwtVerification(format!("x5c decode: {e}")))?;
+                    chain_der.push(der);
                 }
+
+                let leaf_der = chain_der.first().ok_or_else(|| {
+                    SvtError::JwtVerification("x5c header present but empty".into())
+                })?;
+
+                if trusted_certs_der.is_empty() {
+                    // No trust anchors configured: there is nothing to validate
+                    // against, so we cannot establish trust. Fail closed rather
+                    // than silently accepting an attacker-supplied certificate.
+                    return Err(SvtError::JwtVerification(
+                        "SVT x5c certificate cannot be trusted: no trusted certificates configured"
+                            .into(),
+                    ));
+                }
+
+                // Fast path: the signing certificate is itself a trust anchor.
+                if trusted_certs_der.contains(leaf_der) {
+                    return Ok(leaf_der.clone());
+                }
+
+                // Otherwise the signing certificate must chain to an anchor.
+                Self::ensure_x5c_chains_to_trust(&chain_der, trusted_certs_der)?;
+                return Ok(leaf_der.clone());
             }
         }
 

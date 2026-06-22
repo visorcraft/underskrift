@@ -9,8 +9,11 @@ use lopdf::{Document, Object};
 #[cfg(feature = "visual")]
 use lopdf::{Dictionary, Stream};
 
-use crate::cms::builder::{CmsProfile, PdfCmsBuilder, SigningTimePlacement};
+use crate::cms::builder::{
+    CmsProfile, CommitmentType, PdfCmsBuilder, SignaturePolicy, SigningTimePlacement,
+};
 use crate::core::acroform;
+use crate::core::doc_mdp::{self, DocMdpPermissions};
 use crate::core::incremental::IncrementalWriter;
 use crate::core::parser;
 use crate::core::sig_dict::{self, SigSubFilter};
@@ -83,6 +86,9 @@ pub struct SigningOptions {
     pub tsa_url: Option<String>,
     /// Whether this is a certification signature (first signature with DocMDP)
     pub certify: bool,
+    /// Permission level applied when `certify` is true (DocMDP `/P`).
+    /// Ignored for non-certification signatures.
+    pub certify_permissions: DocMdpPermissions,
     /// Algorithm registry for validating that the signer's algorithms are allowed.
     ///
     /// When set, the signing pipeline will validate the signer's digest and
@@ -114,6 +120,12 @@ pub struct SigningOptions {
     ///
     /// Defaults to `SigningTimePlacement::Signed`.
     pub signing_time_placement: SigningTimePlacement,
+    /// Optional ETSI `commitment-type-indication` signed attribute, declaring
+    /// what the signer commits to (e.g. proof of origin/approval).
+    pub commitment_type: Option<CommitmentType>,
+    /// Optional ETSI `signature-policy-identifier` signed attribute, binding
+    /// the signature to an explicit, hash-committed signature policy.
+    pub signature_policy: Option<SignaturePolicy>,
 }
 
 impl Default for SigningOptions {
@@ -131,11 +143,14 @@ impl Default for SigningOptions {
             #[cfg(feature = "tsp")]
             tsa_url: None,
             certify: false,
+            certify_permissions: DocMdpPermissions::default(),
             algorithm_registry: None,
             #[cfg(feature = "visual")]
             visible_signature: None,
             cms_signing_time: None,
             signing_time_placement: SigningTimePlacement::default(),
+            commitment_type: None,
+            signature_policy: None,
         }
     }
 }
@@ -203,6 +218,8 @@ impl PdfSigner {
                 .map_err(PdfSignError::AlgorithmNotAllowed)?;
         }
 
+        self.validate_options()?;
+
         // Step 1: Parse the PDF
         let mut doc = Document::load_mem(pdf_data).map_err(CoreError::Lopdf)?;
 
@@ -242,7 +259,15 @@ impl PdfSigner {
             );
         }
 
-        // Step 4: Add sig dict as a new object
+        // Step 4: For a certification signature, add the DocMDP /Reference.
+        if self.options.certify {
+            sig_dict.set(
+                "Reference",
+                doc_mdp::build_docmdp_reference(self.options.certify_permissions),
+            );
+        }
+
+        // Add sig dict as a new object
         let sig_dict_id = doc.add_object(Object::Dictionary(sig_dict));
 
         // Step 4b: Generate visible signature appearance if configured
@@ -537,12 +562,22 @@ impl PdfSigner {
         // New objects: sig_dict, sig_field
         // Modified objects: catalog (AcroForm reference), page (Annots), and possibly the AcroForm itself
         writer.set_sig_dict_id(sig_dict_id);
+        writer.set_trailer_meta(meta.id.clone(), meta.encrypt.clone(), meta.uses_xref_stream);
 
         // Add all objects from the document that have IDs > the original max
         // (these are the new objects we created), plus any modified objects.
         // For simplicity, we add the sig dict, sig field, and re-serialize
         // any objects that were modified (catalog, acroform, page).
         let catalog_id = meta.root_id;
+
+        // For a certification signature, the catalog must reference the
+        // certifying signature via /Perms /DocMDP. Mutate the catalog before it
+        // is re-serialized into the incremental update below.
+        if self.options.certify {
+            if let Ok(catalog) = doc.get_dictionary_mut(catalog_id) {
+                catalog.set("Perms", doc_mdp::build_docmdp_perms(sig_dict_id));
+            }
+        }
 
         // Add sig dict
         if let Ok(obj) = doc.get_object(sig_dict_id) {
@@ -604,13 +639,18 @@ impl PdfSigner {
             SubFilter::Pades => CmsProfile::Pades,
             SubFilter::Pkcs7 => CmsProfile::Traditional,
         };
-        let cms_builder = PdfCmsBuilder::new(signer)
+        let mut cms_builder = PdfCmsBuilder::new(signer)
             .profile(cms_profile)
             .signing_time_placement(self.options.signing_time_placement);
-        let cms_builder = match self.options.cms_signing_time {
-            Some(t) => cms_builder.signing_time(t),
-            None => cms_builder,
-        };
+        if let Some(t) = self.options.cms_signing_time {
+            cms_builder = cms_builder.signing_time(t);
+        }
+        if let Some(commitment) = self.options.commitment_type {
+            cms_builder = cms_builder.commitment_type(commitment);
+        }
+        if let Some(policy) = &self.options.signature_policy {
+            cms_builder = cms_builder.signature_policy(policy.clone());
+        }
         let cms_der = cms_builder.build(&data_hash)?;
 
         // Step 11: Check that the CMS signature fits in the allocated space
@@ -636,7 +676,70 @@ impl PdfSigner {
             *b = b'0';
         }
 
-        Ok(output)
+        // Step 13: Upgrade to the requested PAdES baseline level (B-T adds a
+        // document timestamp; higher levels are handled here too). B-B returns
+        // the bytes unchanged.
+        self.apply_pades_level(output).await
+    }
+
+    /// Apply the post-signing steps required by the configured [`PadesLevel`].
+    ///
+    /// - **B-B**: nothing to do.
+    /// - **B-T**: append a `/DocTimeStamp` over the signed document using the
+    ///   configured TSA. Requires `tsa_url` and the `tsp` feature.
+    /// - **B-LT / B-LTA**: not yet wired in the high-level signer (they require
+    ///   embedding DSS validation data as a further revision and, for B-LTA, an
+    ///   archive timestamp). Rather than silently under-deliver the requested
+    ///   level, this returns an explicit configuration error.
+    async fn apply_pades_level(&self, signed: Vec<u8>) -> Result<Vec<u8>, PdfSignError> {
+        match self.options.pades_level {
+            PadesLevel::BB => Ok(signed),
+            PadesLevel::BT => {
+                #[cfg(feature = "tsp")]
+                {
+                    let url = self.options.tsa_url.as_deref().ok_or_else(|| {
+                        PdfSignError::Configuration(
+                            "PAdES B-T requires a TSA URL (set SigningOptions.tsa_url)".into(),
+                        )
+                    })?;
+                    let tsa = crate::tsp::TsaClient::new(url);
+                    let ts_opts = crate::core::doc_timestamp::DocTimestampOptions {
+                        content_size: self.options.content_size,
+                        ..Default::default()
+                    };
+                    crate::core::doc_timestamp::add_document_timestamp(&signed, &tsa, &ts_opts)
+                        .await
+                }
+                #[cfg(not(feature = "tsp"))]
+                {
+                    let _ = &signed;
+                    Err(PdfSignError::Configuration(
+                        "PAdES B-T requires the `tsp` feature to be enabled".into(),
+                    ))
+                }
+            }
+            PadesLevel::BLT | PadesLevel::BLTA => Err(PdfSignError::Configuration(
+                "PAdES B-LT/B-LTA is not yet implemented in the high-level signer; it requires \
+                 embedding DSS validation data (and, for B-LTA, an archive timestamp). Produce a \
+                 B-T signature and extend it via the DSS/timestamp APIs, or request B-B/B-T."
+                    .into(),
+            )),
+        }
+    }
+
+    fn validate_options(&self) -> Result<(), PdfSignError> {
+        if self.options.sub_filter == SubFilter::Pades
+            && self.options.reason.is_some()
+            && (self.options.commitment_type.is_some() || self.options.signature_policy.is_some())
+        {
+            return Err(PdfSignError::Configuration(
+                "PAdES signatures with commitment-type-indication or signature-policy-identifier \
+                 must not also set the PDF /Reason entry; put the semantics in the CMS attribute"
+                    .into(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
