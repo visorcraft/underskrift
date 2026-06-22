@@ -53,6 +53,9 @@ pub enum PdfSignError {
     #[error("Algorithm not allowed: {0}")]
     AlgorithmNotAllowed(String),
 
+    #[error("Configuration error: {0}")]
+    Configuration(String),
+
     #[error("Visual signature error: {0}")]
     Visual(#[from] VisualError),
 

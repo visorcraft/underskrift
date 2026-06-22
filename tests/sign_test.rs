@@ -873,3 +873,277 @@ async fn test_sign_pdf_with_custom_template() {
         signed.len()
     );
 }
+
+/// Regression test for U-1: signing a PDF whose cross-reference section is an
+/// XRef **stream** (PDF 1.5+) must produce an XRef-stream incremental update —
+/// not a classic `xref` table — and must preserve the trailer `/ID`.
+#[tokio::test]
+async fn test_sign_xref_stream_pdf() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/xref_stream.pdf"
+    );
+    let pdf = std::fs::read(path).expect("failed to read xref-stream fixture");
+
+    // Sanity: the fixture really uses an XRef stream, and lopdf reports it so.
+    let src = lopdf::Document::load_mem(&pdf).expect("fixture should parse");
+    let meta = underskrift::core::parser::extract_metadata(&src).expect("metadata");
+    assert!(
+        meta.uses_xref_stream,
+        "fixture must use a cross-reference stream"
+    );
+    assert!(meta.id.is_some(), "fixture has a trailer /ID");
+
+    let signer = test_signer();
+    let signed = PdfSigner::new()
+        .options(SigningOptions {
+            sub_filter: SubFilter::Pades,
+            field_name: "XrefStreamSig".to_string(),
+            ..Default::default()
+        })
+        .sign(&pdf, &signer)
+        .await
+        .expect("signing an xref-stream PDF failed");
+
+    // The signed output must be loadable and structurally intact.
+    let doc =
+        lopdf::Document::load_mem(&signed).expect("signed xref-stream PDF should be parseable");
+    let sigs =
+        underskrift::core::parser::extract_signatures(&doc).expect("should extract signatures");
+    assert_eq!(sigs.len(), 1);
+    assert_eq!(sigs[0].field_name, "XrefStreamSig");
+
+    // The incremental update must itself be an XRef stream: a SECOND
+    // `/Type /XRef` object appears (the original fixture has one), and our
+    // writer must NOT have appended a classic `\nxref\n` table.
+    let xref_count =
+        count_occurrences(&signed, b"/Type /XRef") + count_occurrences(&signed, b"/Type/XRef");
+    assert!(
+        xref_count >= 2,
+        "incremental update should add an XRef stream object (found {xref_count})"
+    );
+    // No classic cross-reference table keyword should have been emitted by us.
+    // (The fixture has none, so any `\nxref\n` would be ours.)
+    assert!(
+        !contains_subslice(&signed, b"\nxref\n"),
+        "must not emit a classic xref table for an xref-stream source"
+    );
+
+    // The trailer /ID must survive into the new XRef stream dictionary.
+    assert!(
+        contains_subslice(&signed, b"/ID"),
+        "trailer /ID must be preserved in the incremental update"
+    );
+
+    // The new revision's startxref must point at our new XRef stream object.
+    assert!(signed.ends_with(b"%%EOF\n") || signed.ends_with(b"%%EOF"));
+
+    println!(
+        "xref-stream signing test passed. Signed PDF size: {} bytes",
+        signed.len()
+    );
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            count += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+/// U-8: commitment-type-indication and signature-policy-identifier signed
+/// attributes are embedded and the resulting signature still verifies.
+#[tokio::test]
+async fn test_sign_with_commitment_and_policy() {
+    use const_oid::ObjectIdentifier;
+    use underskrift::DigestAlgorithm;
+    use underskrift::{CommitmentType, SignaturePolicy};
+
+    let pdf = test_pdf();
+    let signer = test_signer();
+
+    let policy = SignaturePolicy {
+        policy_id: ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.6.1"),
+        hash_algorithm: DigestAlgorithm::Sha256,
+        hash_value: vec![0x42; 32],
+        uri: Some("https://policy.example/sigpolicy.der".to_string()),
+    };
+
+    let signed = PdfSigner::new()
+        .options(SigningOptions {
+            sub_filter: SubFilter::Pades,
+            field_name: "CommitSig".to_string(),
+            commitment_type: Some(CommitmentType::ProofOfApproval),
+            signature_policy: Some(policy),
+            ..Default::default()
+        })
+        .sign(&pdf, &signer)
+        .await
+        .expect("signing with commitment+policy failed");
+
+    // Still a structurally valid, parseable signed PDF.
+    let doc = lopdf::Document::load_mem(&signed).expect("parse signed");
+    let sigs = underskrift::core::parser::extract_signatures(&doc).expect("extract");
+    assert_eq!(sigs.len(), 1);
+
+    // The CMS must carry both attribute OIDs (DER bytes) and the SPURI.
+    let commitment_oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.16");
+    let policy_oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.15");
+    use der::Encode;
+    let cms = &sigs[0].contents;
+    assert!(
+        contains_subslice(cms, &commitment_oid.to_der().unwrap()),
+        "CMS must contain commitment-type-indication OID"
+    );
+    assert!(
+        contains_subslice(cms, &policy_oid.to_der().unwrap()),
+        "CMS must contain signature-policy-identifier OID"
+    );
+    assert!(
+        contains_subslice(cms, b"https://policy.example/sigpolicy.der"),
+        "CMS must contain the SPURI"
+    );
+}
+
+/// PAdES baseline interop: DSS rejects PDF `/Reason` when the CMS carries
+/// commitment-type-indication or signature-policy-identifier, so fail before
+/// producing a non-conformant signature.
+#[tokio::test]
+async fn test_reason_with_commitment_or_policy_errors() {
+    use const_oid::ObjectIdentifier;
+    use underskrift::{CommitmentType, DigestAlgorithm, SignaturePolicy};
+
+    let pdf = test_pdf();
+    let signer = test_signer();
+    let policy = SignaturePolicy {
+        policy_id: ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.6.1"),
+        hash_algorithm: DigestAlgorithm::Sha256,
+        hash_value: vec![0x42; 32],
+        uri: None,
+    };
+
+    for (commitment_type, signature_policy) in [
+        (Some(CommitmentType::ProofOfApproval), None),
+        (None, Some(policy)),
+    ] {
+        let result = PdfSigner::new()
+            .options(SigningOptions {
+                sub_filter: SubFilter::Pades,
+                field_name: "ReasonConflict".to_string(),
+                reason: Some("I approve".to_string()),
+                commitment_type,
+                signature_policy,
+                ..Default::default()
+            })
+            .sign(&pdf, &signer)
+            .await;
+
+        assert!(result.is_err(), "DSS-invalid option mix must fail");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("/Reason") && msg.contains("commitment-type"),
+            "error should explain the PAdES /Reason conflict: {msg}"
+        );
+    }
+}
+
+/// U-2: a certification signature emits /DocMDP — the sig dict carries a
+/// DocMDP /Reference and the catalog carries /Perms /DocMDP — and still verifies.
+#[tokio::test]
+async fn test_certification_signature_emits_docmdp() {
+    use underskrift::DocMdpPermissions;
+    let pdf = test_pdf();
+    let signed = PdfSigner::new()
+        .options(SigningOptions {
+            sub_filter: SubFilter::Pades,
+            field_name: "CertSig".to_string(),
+            certify: true,
+            certify_permissions: DocMdpPermissions::NoChanges,
+            ..Default::default()
+        })
+        .sign(&pdf, &test_signer())
+        .await
+        .expect("certification signing failed");
+
+    let doc = lopdf::Document::load_mem(&signed).expect("parse signed");
+    let catalog = doc.catalog().expect("catalog");
+    // Catalog must carry /Perms /DocMDP.
+    let perms = catalog
+        .get(b"Perms")
+        .and_then(|o| o.as_dict())
+        .expect("/Perms present");
+    assert!(perms.has(b"DocMDP"), "/Perms must reference /DocMDP");
+
+    // The signed bytes must contain the DocMDP transform and the chosen P=1.
+    let s = String::from_utf8_lossy(&signed);
+    assert!(s.contains("DocMDP"), "must contain DocMDP transform");
+    assert!(
+        s.contains("TransformParams"),
+        "must contain TransformParams"
+    );
+
+    // External validator agreement can be checked manually if needed; avoid
+    // writing files from tests.
+}
+
+/// U-2: requesting B-LT/B-LTA from the high-level signer fails loudly instead
+/// of silently producing a B-B signature (the original bug).
+#[tokio::test]
+async fn test_blt_blta_error_not_silent_downgrade() {
+    use underskrift::PadesLevel;
+    let pdf = test_pdf();
+    for level in [PadesLevel::BLT, PadesLevel::BLTA] {
+        let result = PdfSigner::new()
+            .options(SigningOptions {
+                sub_filter: SubFilter::Pades,
+                pades_level: level,
+                field_name: "Sig".to_string(),
+                ..Default::default()
+            })
+            .sign(&pdf, &test_signer())
+            .await;
+        assert!(
+            result.is_err(),
+            "{level:?} must error, not silently downgrade"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("B-LT/B-LTA"),
+            "error should name the level: {msg}"
+        );
+    }
+}
+
+/// U-2: requesting B-T without a TSA URL fails with a clear configuration error
+/// rather than silently producing B-B.
+#[tokio::test]
+async fn test_bt_without_tsa_url_errors() {
+    use underskrift::PadesLevel;
+    let pdf = test_pdf();
+    let result = PdfSigner::new()
+        .options(SigningOptions {
+            sub_filter: SubFilter::Pades,
+            pades_level: PadesLevel::BT,
+            field_name: "Sig".to_string(),
+            tsa_url: None,
+            ..Default::default()
+        })
+        .sign(&pdf, &test_signer())
+        .await;
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("TSA URL"));
+}

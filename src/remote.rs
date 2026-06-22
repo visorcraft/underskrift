@@ -286,6 +286,7 @@ pub fn prepare_signature(
     );
 
     writer.set_sig_dict_id(sig_dict_id);
+    writer.set_trailer_meta(meta.id.clone(), meta.encrypt.clone(), meta.uses_xref_stream);
 
     // Add new objects
     if let Ok(obj) = doc.get_object(sig_dict_id) {
