@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.75"
 description = "PDF digital signing library — PAdES B-B through B-LTA, PKCS#7, visible/invisible signatures, LTV, and verification"
 license = "BSD-2-Clause"
-repository = "https://github.com/kushaldas/underskrift"
+repository = "https://github.com/visorcraft/underskrift"
 keywords = ["pdf", "signing", "pades", "pkcs7", "digital-signature"]
 categories = ["cryptography", "parser-implementations"]
 
